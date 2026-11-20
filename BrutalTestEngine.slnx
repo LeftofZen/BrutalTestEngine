@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/BrutalTestEngine/BrutalTestEngine.csproj" />
+    <Project Path="src/BrutalTestEngine.Game/BrutalTestEngine.Game.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BrutalTestEngine.Tests/BrutalTestEngine.Tests.csproj" />
+  </Folder>
+</Solution>
