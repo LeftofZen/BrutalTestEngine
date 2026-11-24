@@ -48,6 +48,16 @@ public interface ICommandHandler
 
     void Handle(ResetSimulationCommand command);
 
+    void Handle(CaptureFrameCommand command);
+
+    void Handle(SetLogLevelCommand command);
+
+    void Handle(AddBodyCommand command);
+
+    void Handle(SetGravityCommand command);
+
+    void Handle(SetVolumeCommand command);
+
     void Handle(UnhandledCommand command);
 }
 
@@ -104,7 +114,23 @@ public static class CommandDispatcher
                 break;
             case ResetSimulationCommand reset:
                 handler.Handle(reset);
-                break;            case UnhandledCommand unhandled:
+                break;
+            case CaptureFrameCommand capture:
+                handler.Handle(capture);
+                break;
+            case SetLogLevelCommand logLevel:
+                handler.Handle(logLevel);
+                break;
+            case AddBodyCommand addBody:
+                handler.Handle(addBody);
+                break;
+            case SetGravityCommand setGravity:
+                handler.Handle(setGravity);
+                break;
+            case SetVolumeCommand setVolume:
+                handler.Handle(setVolume);
+                break;
+            case UnhandledCommand unhandled:
                 handler.Handle(unhandled);
                 break;
             default:

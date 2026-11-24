@@ -49,8 +49,34 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
     private const float ScaleAmplitude = 0.25f;
     private const double TicksPerSecondWindowSeconds = 0.5;
 
+    /// <summary>Gravity the entity store integrates, in metres per second squared.</summary>
+    private const float GravityY = -9.81f;
+
+    /// <summary>Height of the floor the entity store resolves against.</summary>
+    private const float FloorY = 0.0f;
+
+    /// <summary>How long an entity lives before it is expired, in simulated seconds.</summary>
+    private const float EntityLifetimeSeconds = 30.0f;
+
+    /// <summary>
+    /// How many entities the tick keeps alive. A cap rather than unbounded growth, because the store is a
+    /// fixed-size working set in a real world too: the point of the layout is that the set is contiguous and
+    /// bounded, not that it is infinite.
+    /// </summary>
+    private const int MaxEntities = 4096;
+
     private readonly CommandBus _bus;
     private readonly TripleBuffer<SimulationSnapshot> _snapshots = new(() => SimulationSnapshot.Empty);
+
+    /// <summary>
+    /// The simulation's entity storage: struct-of-arrays, dense, and stepped in place every tick.
+    /// </summary>
+    /// <remarks>
+    /// This is the engine's data-oriented core rather than a demonstration of one. The tick integrates it,
+    /// resolves it against the floor and expires it, all as flat array passes with no per-entity allocation
+    /// and no virtual dispatch. See <see cref="EntityStore"/> for why the layout is what it is.
+    /// </remarks>
+    private readonly EntityStore _entities = new();
     private readonly Thread _thread;
     private readonly CancellationTokenSource _cancellation = new();
     private readonly Func<InputSnapshot> _readInput;
@@ -91,10 +117,10 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
     /// <param name="readPendingEngineCommands">
     /// Reads how many engine commands are still waiting for the main thread to apply them.
     /// </param>
-        /// <param name="timers">
-        /// Where this thread records how long its tick, cycle and command drain take. Shared with every other
-        /// thread so the debug panel can compare them side by side.
-        /// </param>
+    /// <param name="timers">
+    /// Where this thread records how long its tick, cycle and command drain take. Shared with every other
+    /// thread so the debug panel can compare them side by side.
+    /// </param>
     public SimulationThread(
         CommandBus bus,
         double ticksPerSecond,
@@ -108,7 +134,7 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
     )
     {
         ArgumentNullException.ThrowIfNull(bus);
-            ArgumentNullException.ThrowIfNull(timers);
+        ArgumentNullException.ThrowIfNull(timers);
 
         _bus = bus;
         SetTicksPerSecond(ticksPerSecond);
@@ -120,10 +146,10 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
         _readNetworkCount = readNetworkCount;
         _readPendingEngineCommands = readPendingEngineCommands;
 
-            // Resolved once so the hot loop records into a plain reference with no lookup.
-            _tickMetrics = timers.Get(ThreadTimerRegistry.Keys.SimulationTick);
-            _cycleMetrics = timers.Get(ThreadTimerRegistry.Keys.SimulationCycle);
-            _drainMetrics = timers.Get(ThreadTimerRegistry.Keys.SimulationDrain);
+        // Resolved once so the hot loop records into a plain reference with no lookup.
+        _tickMetrics = timers.Get(ThreadTimerRegistry.Keys.SimulationTick);
+        _cycleMetrics = timers.Get(ThreadTimerRegistry.Keys.SimulationCycle);
+        _drainMetrics = timers.Get(ThreadTimerRegistry.Keys.SimulationDrain);
 
         _thread = new Thread(Run)
         {
@@ -145,6 +171,16 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
 
     /// <summary>Number of simulation commands this thread has applied.</summary>
     public long CommandsApplied => Interlocked.Read(ref _commandsApplied);
+
+    /// <summary>
+    /// Number of live entities in the data-oriented entity store.
+    /// </summary>
+    /// <remarks>
+    /// Read from the store rather than from a counter, because the store is the authority: a counter could
+    /// drift from the arrays it is supposed to describe, and the whole point of the layout is that the count
+    /// and the data are the same fact.
+    /// </remarks>
+    public int EntityCount => _entities.Count;
 
     /// <summary>True while the passage of simulated time is halted by a pause command.</summary>
     public bool IsPaused => Volatile.Read(ref _paused) != 0;
@@ -197,6 +233,7 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
         _elapsedSeconds = 0;
         _rotationRadians = 0;
         _scale = 1.0f;
+        _entities.Clear();
 
         Interlocked.Exchange(ref _droppedTicks, 0);
         Interlocked.Exchange(ref _ticksInWindow, 0);
@@ -227,6 +264,16 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
 
     void ICommandHandler.Handle(FocusCommand command) => Ignore();
 
+    void ICommandHandler.Handle(CaptureFrameCommand command) => Ignore();
+
+    void ICommandHandler.Handle(SetLogLevelCommand command) => Ignore();
+
+    void ICommandHandler.Handle(AddBodyCommand command) => Ignore();
+
+    void ICommandHandler.Handle(SetGravityCommand command) => Ignore();
+
+    void ICommandHandler.Handle(SetVolumeCommand command) => Ignore();
+
     void ICommandHandler.Handle(UnhandledCommand command) => Ignore();
 
     private static void Ignore()
@@ -244,11 +291,12 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
 
         while (!token.IsCancellationRequested)
         {
-                var cycleStartedAt = Stopwatch.GetTimestamp();
+            var cycleStartedAt = Stopwatch.GetTimestamp();
 
-                var drainStartedAt = Stopwatch.GetTimestamp();
+            var commandsAppliedBefore = _commandsApplied;
+            var drainStartedAt = Stopwatch.GetTimestamp();
             _commandsApplied += _bus.Drain(CommandTarget.Simulation, this, MaxCommandsPerDrain);
-                _drainMetrics.RecordSince(drainStartedAt);
+            _drainMetrics.RecordSince(drainStartedAt);
 
             var ticked = false;
 
@@ -262,7 +310,7 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
                 if (Interlocked.Read(ref _pendingSteps) > 0)
                 {
                     Interlocked.Decrement(ref _pendingSteps);
-                        TimedTick();
+                    TimedTick();
                     ticked = true;
                 }
             }
@@ -273,7 +321,7 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
                 var fixedDelta = FixedDeltaSeconds;
                 while (accumulator >= fixedDelta && !IsPaused)
                 {
-                        TimedTick();
+                    TimedTick();
                     accumulator -= fixedDelta;
                     fixedDelta = FixedDeltaSeconds;
                     ticked = true;
@@ -289,15 +337,27 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
 
             UpdateTicksPerSecond(clock.Elapsed.TotalSeconds);
 
-                // Measured before the sleep below, so this is the loop's own work: the tick, the drain, the publish
-                // and the bookkeeping. The sleep is deliberately excluded, because it is idle time by design and
-                // folding it in would make the number just read back as the tick period.
+            // Measured before the sleep below, so this is the loop's own work: the tick, the drain, the publish
+            // and the bookkeeping. The sleep is deliberately excluded, because it is idle time by design and
+            // folding it in would make the number just read back as the tick period.
+            //
+            // Recorded only when the iteration did something. An iteration that found no elapsed time to
+            // simulate and no command to apply is a wait, not a cycle, and recording it would bury the real
+            // cycles under thousands of near-zero samples and inflate the metric's sample count without
+            // telling anyone anything.
+            if (ticked || _commandsApplied != commandsAppliedBefore)
                 _cycleMetrics.RecordSince(cycleStartedAt);
 
             var remaining = FixedDeltaSeconds - accumulator;
             if (remaining > 0)
             {
-                var sleepMilliseconds = (int)Math.Min(remaining * 1000.0, PollTimeoutMilliseconds);
+                // Round up rather than truncate. Truncating a sub-millisecond remainder to zero meant the
+                // loop never slept at all: it spun for the whole tick period, roughly 2,500 iterations per
+                // tick at 60 Hz, recording a metric sample on each one. Rounding up turns that into a
+                // handful of real waits per tick. The cap keeps command latency and cancellation response
+                // bounded when the tick period is long, because the bus has no wake signal to interrupt a
+                // longer sleep.
+                var sleepMilliseconds = (int)Math.Min(Math.Ceiling(remaining * 1000.0), PollTimeoutMilliseconds);
                 if (sleepMilliseconds > 0)
                     token.WaitHandle.WaitOne(sleepMilliseconds);
             }
@@ -306,20 +366,20 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
         PublishSnapshot();
     }
 
-        /// <summary>
-        /// Runs one tick and records how long it took.
-        /// </summary>
-        /// <remarks>
-        /// A separate method rather than a stopwatch inside <see cref="Tick"/> so the measurement cannot drift
-        /// if a caller ever invokes the tick directly, and so the cost of a tick stays a property of the loop
-        /// that runs it.
-        /// </remarks>
-        private void TimedTick()
-        {
-            var startedAt = Stopwatch.GetTimestamp();
-            Tick();
-            _tickMetrics.RecordSince(startedAt);
-        }
+    /// <summary>
+    /// Runs one tick and records how long it took.
+    /// </summary>
+    /// <remarks>
+    /// A separate method rather than a stopwatch inside <see cref="Tick"/> so the measurement cannot drift
+    /// if a caller ever invokes the tick directly, and so the cost of a tick stays a property of the loop
+    /// that runs it.
+    /// </remarks>
+    private void TimedTick()
+    {
+        var startedAt = Stopwatch.GetTimestamp();
+        Tick();
+        _tickMetrics.RecordSince(startedAt);
+    }
 
     private double ConsumeElapsedSeconds(Stopwatch clock, ref double previousSeconds)
     {
@@ -360,8 +420,49 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
 
         _scale = 1.0f + (ScaleAmplitude * MathF.Sin((float)_elapsedSeconds));
 
+        StepEntities();
+
         Interlocked.Increment(ref _ticksExecuted);
         Interlocked.Increment(ref _ticksInWindow);
+    }
+
+    /// <summary>
+    /// Advances the entity store by one tick.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The order is the order a real world would use: spawn, integrate, resolve contacts, expire. Each stage
+    /// is a flat pass over one or two arrays, so the whole step is a handful of sequential memory walks with
+    /// no allocation and no indirection.
+    /// </para>
+    /// <para>
+    /// Spawning is driven by the tick counter rather than by a timer, so the population is a deterministic
+    /// function of the tick number. That is what makes a recorded command stream replayable: the same ticks
+    /// produce the same entities on every node.
+    /// </para>
+    /// </remarks>
+    private void StepEntities()
+    {
+        var delta = (float)FixedDeltaSeconds;
+
+        // One spawn every 30 ticks, at a position derived from the tick so it is reproducible.
+        if (_tick % 30 == 0 && _entities.Count < MaxEntities)
+        {
+            var phase = _tick * 0.017f;
+            _entities.Add(
+                MathF.Sin(phase) * 4.0f,
+                6.0f,
+                MathF.Cos(phase) * 4.0f,
+                MathF.Cos(phase) * 0.5f,
+                0.0f,
+                -MathF.Sin(phase) * 0.5f,
+                0.25f
+            );
+        }
+
+        _entities.Integrate(delta, GravityY);
+        _entities.ResolveFloor(FloorY);
+        _entities.RemoveExpired(EntityLifetimeSeconds);
     }
 
     private void UpdateTicksPerSecond(double now)
@@ -398,6 +499,7 @@ public sealed class SimulationThread : IDisposable, ICommandHandler
             snapshot.IoJobsCompleted = _readIoCount();
             snapshot.NetworkMessagesProcessed = _readNetworkCount();
             snapshot.PendingEngineCommands = _readPendingEngineCommands();
+            snapshot.EntityCount = _entities.Count;
             snapshot.Input = input;
         });
     }

@@ -11,5 +11,5 @@ internal sealed unsafe class SwapchainState
     public required VkImageView[] ImageViews { get; init; }
     public required VkFramebuffer[] Framebuffers { get; init; }
     public required VkExtent2D Extent { get; init; }
-        public required VkFormat Format { get; init; }
+    public required VkFormat Format { get; init; }
 }

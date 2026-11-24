@@ -36,6 +36,11 @@ public class CommandTargetTests
         new StepSimulationCommand { Source = CommandSource.System, Ticks = 1 },
         new SetPausedCommand { Source = CommandSource.System, Paused = true },
         new ResetSimulationCommand { Source = CommandSource.System },
+        new CaptureFrameCommand { Source = CommandSource.System },
+        new SetLogLevelCommand { Source = CommandSource.System, Level = "debug" },
+        new AddBodyCommand { Source = CommandSource.System },
+        new SetGravityCommand { Source = CommandSource.System },
+        new SetVolumeCommand { Source = CommandSource.System },
     ];
 
     /// <summary>
@@ -60,6 +65,11 @@ public class CommandTargetTests
         [typeof(StepSimulationCommand)] = CommandTarget.Simulation,
         [typeof(SetPausedCommand)] = CommandTarget.Simulation,
         [typeof(ResetSimulationCommand)] = CommandTarget.Simulation,
+        [typeof(CaptureFrameCommand)] = CommandTarget.Engine,
+        [typeof(SetLogLevelCommand)] = CommandTarget.Engine,
+        [typeof(AddBodyCommand)] = CommandTarget.Physics,
+        [typeof(SetGravityCommand)] = CommandTarget.Physics,
+        [typeof(SetVolumeCommand)] = CommandTarget.Audio,
     };
 
     [Test]
@@ -146,6 +156,16 @@ public class CommandTargetTests
         public void Handle(SetPausedCommand command) { }
 
         public void Handle(ResetSimulationCommand command) { }
+
+        public void Handle(CaptureFrameCommand command) { }
+
+        public void Handle(SetLogLevelCommand command) { }
+
+        public void Handle(AddBodyCommand command) { }
+
+        public void Handle(SetGravityCommand command) { }
+
+        public void Handle(SetVolumeCommand command) { }
 
         public void Handle(UnhandledCommand command) { }
     }

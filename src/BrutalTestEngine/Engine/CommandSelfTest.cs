@@ -31,6 +31,7 @@ public sealed class CommandSelfTest : IDisposable
     private readonly CancellationTokenSource _cancellation = new();
     private readonly List<string> _report = [];
     private readonly Thread _thread;
+    private RakNetTransport? _networkPeer;
     private long _baselineAccepted;
     private long _expectedInput;
     private long _expectedNetwork;
@@ -112,27 +113,68 @@ public sealed class CommandSelfTest : IDisposable
         Volatile.Write(ref _finished, 1);
     }
 
-    /// <summary>Proves a genuinely outbound UDP datagram is received, parsed and applied.</summary>
+    /// <summary>
+    /// Proves a genuinely separate peer can connect, send commands, and be refused malformed ones.
+    /// </summary>
+    /// <remarks>
+    /// A real second RakNet peer rather than a raw socket, because that is the only way to exercise the
+    /// connection path at all: RakNet ignores traffic from unknown systems, so a bare UDP datagram would be
+    /// dropped by the transport before the engine ever saw it. Running the peer in this process keeps the
+    /// self-test to a single executable without weakening it — the bytes still cross a real loopback socket and
+    /// go through a real RakNet handshake.
+    /// </remarks>
     private void RunNetwork()
     {
         var endpoint = _networkThread.LocalEndPoint;
 
-        // Sent from a brand new socket rather than the engine's own, so this is a real inbound datagram and
-        // not an echo of something the engine sent itself.
-        using var sender = new System.Net.Sockets.UdpClient(0);
+        _networkPeer = new RakNetTransport($"127.0.0.1:{endpoint.Port}");
+        _networkPeer.Open(0);
 
-        var lines = "tick-rate 120\nkey down Left\nkey up Left";
-        var payload = System.Text.Encoding.UTF8.GetBytes(lines);
-        sender.Send(payload, payload.Length, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, endpoint.Port));
+        if (!WaitForConnection(_networkPeer))
+        {
+            Add($"network: peer never connected to {endpoint}");
+            _expectedNetwork = 0;
+            return;
+        }
 
-        // A malformed frame must be rejected without posting a command, so the transport is proven to
-        // validate rather than to forward anything it is handed.
-        var oversized = new byte[4096];
+        var commands = "tick-rate 120\nkey down Left\nkey up Left";
+        var payload = System.Text.Encoding.UTF8.GetBytes(commands);
+        var sent = _networkPeer.Send(payload);
+
+        // A frame larger than the transport permits must be refused before it reaches the wire, so a peer
+        // cannot hand the engine something bigger than the contract allows it to decode.
+        var oversized = new byte[_networkPeer.MaxPayloadSize + 1];
         Array.Fill(oversized, (byte)'a');
-        sender.Send(oversized, oversized.Length, new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, endpoint.Port));
+        var oversizedRejected = !_networkPeer.Send(oversized);
 
         _expectedNetwork = 3;
-        Add($"network: sent 3 commands + 1 oversized datagram to {endpoint}");
+        Add(
+            $"network: connected peer sent 3 commands to {endpoint} "
+                + $"(send accepted: {sent}, oversized rejected: {oversizedRejected})"
+        );
+    }
+
+    /// <summary>
+    /// Waits for the self-test peer and the engine's transport to see each other.
+    /// </summary>
+    /// <remarks>
+    /// The handshake is asynchronous, so a command sent immediately after <c>Open</c> would be addressed to a
+    /// peer that does not exist yet and silently dropped — the classic way a self-test becomes flaky rather
+    /// than wrong.
+    /// </remarks>
+    private static bool WaitForConnection(RakNetTransport peer)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (DateTime.UtcNow < deadline)
+        {
+            // Poll to keep the peer's receive queue drained; RakNet completes the handshake internally.
+            _ = peer.Poll(10, out _);
+
+            if (peer.ConnectionCount > 0)
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>Proves a real TCP client can drive the engine.</summary>

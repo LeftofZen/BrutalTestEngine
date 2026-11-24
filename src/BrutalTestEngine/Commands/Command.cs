@@ -27,6 +27,9 @@ public enum CommandSource
 
     /// <summary>A row change observed by the database watcher.</summary>
     Database,
+
+    /// <summary>A tool call delivered by the MCP server.</summary>
+    Mcp,
 }
 
 /// <summary>
@@ -54,6 +57,12 @@ public enum CommandTarget
 
     /// <summary>Applied inside the fixed-timestep simulation tick.</summary>
     Simulation,
+
+    /// <summary>Applied on the physics thread, which owns the physics world at its own timestep.</summary>
+    Physics,
+
+    /// <summary>Applied on the audio thread, which owns the mixer.</summary>
+    Audio,
 }
 
 /// <summary>
@@ -257,6 +266,32 @@ public sealed record ResetSimulationCommand : Command
 }
 
 /// <summary>
+/// Asks the renderer to take a GPU frame capture at the next frame boundary.
+/// </summary>
+/// <remarks>
+/// Routed to the engine rather than the render thread because the render thread has no command queue of its
+/// own — it has a strict per-frame handshake with the main thread, and adding a second ingress would be a
+/// second way to mutate renderer state. The main thread sets a flag the render thread reads, which keeps the
+/// "renderer state is only touched on the render thread" rule intact.
+/// </remarks>
+public sealed record CaptureFrameCommand : Command
+{
+    public override CommandTarget Target => CommandTarget.Engine;
+
+    public override string Describe() => "capture";
+}
+
+/// <summary>Changes the log pipeline's minimum level on a running engine.</summary>
+public sealed record SetLogLevelCommand : Command
+{
+    public required string Level { get; init; }
+
+    public override CommandTarget Target => CommandTarget.Engine;
+
+    public override string Describe() => $"log-level {Level}";
+}
+
+/// <summary>
 /// A line of text that a source (console, rcon, network, web) asked the engine to execute, and which
 /// no component was able to parse.
 /// </summary>
@@ -274,4 +309,54 @@ public sealed record UnhandledCommand : Command
 
     public override string Describe() =>
         Reason is { Length: > 0 } ? $"unhandled \"{Text}\" ({Reason})" : $"unhandled \"{Text}\"";
+}
+
+/// <summary>Drops a sphere into the physics world at a position, from any source.</summary>
+/// <remarks>
+/// A sphere rather than a general shape because it is the smallest body that exercises creation, stepping and
+/// a readable resulting transform. Shape authoring is a content decision; the command vocabulary only has to be
+/// able to demonstrate that physics is command-driven like everything else.
+/// </remarks>
+public sealed record AddBodyCommand : Command
+{
+    public float Radius { get; init; } = 0.5f;
+    public float X { get; init; }
+    public float Y { get; init; } = 5.0f;
+    public float Z { get; init; }
+
+    /// <summary>True for immovable geometry, false for a body the solver moves.</summary>
+    public bool IsStatic { get; init; }
+
+    public override CommandTarget Target => CommandTarget.Physics;
+
+    public override string Describe() =>
+        $"add-body {(IsStatic ? "static" : "dynamic")} r{Round(Radius)} at {Round(X)},{Round(Y)},{Round(Z)}";
+
+    private static string Round(float value) => value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+}
+
+/// <summary>Sets the physics world's gravity.</summary>
+public sealed record SetGravityCommand : Command
+{
+    public float X { get; init; }
+    public float Y { get; init; } = -9.81f;
+    public float Z { get; init; }
+
+    public override CommandTarget Target => CommandTarget.Physics;
+
+    public override string Describe() =>
+        $"gravity {X.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)} "
+        + $"{Y.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)} "
+        + $"{Z.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}";
+}
+
+/// <summary>Sets the master audio volume.</summary>
+public sealed record SetVolumeCommand : Command
+{
+    public float Volume { get; init; } = 1.0f;
+
+    public override CommandTarget Target => CommandTarget.Audio;
+
+    public override string Describe() =>
+        $"volume {Volume.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}";
 }

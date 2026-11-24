@@ -42,10 +42,10 @@ public sealed class ThreadMetrics
     /// </summary>
     public void Record(double elapsedMilliseconds)
     {
-            // Reject anything that is not a real, non-negative duration. Infinity has to be excluded
-            // explicitly, not just NaN: one infinite sample would make the mean and the maximum infinite for
-            // the rest of the session, and the panel would show "∞ ms" with no way to recover but a restart.
-            if (!double.IsFinite(elapsedMilliseconds) || elapsedMilliseconds < 0)
+        // Reject anything that is not a real, non-negative duration. Infinity has to be excluded
+        // explicitly, not just NaN: one infinite sample would make the mean and the maximum infinite for
+        // the rest of the session, and the panel would show "∞ ms" with no way to recover but a restart.
+        if (!double.IsFinite(elapsedMilliseconds) || elapsedMilliseconds < 0)
             return;
 
         lock (_gate)

@@ -34,6 +34,8 @@ public sealed class CommandBus : IDisposable
         CommandTarget.Engine,
         CommandTarget.Input,
         CommandTarget.Simulation,
+        CommandTarget.Physics,
+        CommandTarget.Audio,
     ];
 
     private readonly Dictionary<CommandTarget, MpscQueue<Command>> _queues = new()
@@ -41,6 +43,8 @@ public sealed class CommandBus : IDisposable
         [CommandTarget.Engine] = new MpscQueue<Command>(),
         [CommandTarget.Input] = new MpscQueue<Command>(),
         [CommandTarget.Simulation] = new MpscQueue<Command>(),
+        [CommandTarget.Physics] = new MpscQueue<Command>(),
+        [CommandTarget.Audio] = new MpscQueue<Command>(),
     };
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();

@@ -58,6 +58,9 @@ public sealed class SimulationSnapshot
     /// <summary>Number of engine commands still waiting for the main thread to apply them.</summary>
     public int PendingEngineCommands { get; internal set; }
 
+    /// <summary>Number of live entities in the simulation's data-oriented entity store.</summary>
+    public int EntityCount { get; internal set; }
+
     /// <summary>Current input state as seen by the simulation.</summary>
     public InputSnapshot Input { get; internal set; } = InputSnapshot.Empty;
 

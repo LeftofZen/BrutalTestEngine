@@ -7,8 +7,10 @@ using BrutalTestEngine.Database;
 using BrutalTestEngine.Host;
 using BrutalTestEngine.Input;
 using BrutalTestEngine.Io;
+using BrutalTestEngine.Logging;
 using BrutalTestEngine.Networking;
 using BrutalTestEngine.Simulation;
+using MSLogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace BrutalTestEngine.Engine;
 
@@ -81,17 +83,25 @@ public sealed class Engine : IDisposable, ICommandHandler
     private readonly InputThread _inputThread;
     private readonly IoThread _ioThread;
     private readonly NetworkThread _networkThread;
+    private readonly PhysicsThread _physicsThread;
+    private readonly AudioThread _audioThread;
     private readonly ConsoleCommandSource _consoleSource;
     private readonly RconServer _rconServer;
     private readonly WebCommandSource? _webSource;
     private readonly DatabaseCommandSource? _databaseSource;
+    private readonly McpServerThread? _mcpServer;
+    private readonly CvarRegistry _cvars;
     private readonly CommandSelfTest? _selfTest;
     private readonly StrongBox<long> _inputCommandsObserved;
     private readonly Command[] _logBuffer = new Command[CommandLogCapacity];
-        private readonly ThreadTimerRegistry _timers;
-        private readonly ThreadMetrics _mainFrameMetrics;
-        private readonly ThreadMetrics _mainDrainMetrics;
-        private readonly ThreadMetrics _mainWaitMetrics;
+    private readonly LogEntry[] _logEventBuffer = new LogEntry[LogEventCapacity];
+    private readonly ThreadTimerRegistry _timers;
+    private readonly ThreadMetrics _mainFrameMetrics;
+    private readonly ThreadMetrics _mainDrainMetrics;
+    private readonly ThreadMetrics _mainWaitMetrics;
+
+    // Cached so the frame loop's log calls cost a null check when the level filters them out.
+    private readonly Brutal.Logging.LogCategory _log = EngineLog.Categories.Main;
 
     private double _ticksPerSecond;
     private long _engineCommandsApplied;
@@ -101,7 +111,20 @@ public sealed class Engine : IDisposable, ICommandHandler
     private string? _lastNotice;
     private bool _disposed;
 
+    // The most recent failure reported by a worker thread's Faulted event. Written on the faulting thread
+    // and read on the main thread, so each is a single reference swapped atomically rather than a string
+    // mutated in place. A worker that faults stops its loop, so the last value is the one that matters.
+    // Boxed because the subscriptions are wired in the static factory, before this instance exists.
+    private readonly StrongBox<string?> _physicsFault;
+    private readonly StrongBox<string?> _networkFault;
+
     private const int CommandLogCapacity = 256;
+
+    /// <summary>
+    /// How many log events the debug window's ring buffer keeps. Larger than the command log because a
+    /// startup burst is the most useful thing the window shows, and it is the case most likely to overflow.
+    /// </summary>
+    private const int LogEventCapacity = LogEventBuffer.DefaultCapacity;
 
     private Engine(
         EngineOptions options,
@@ -114,13 +137,19 @@ public sealed class Engine : IDisposable, ICommandHandler
         InputThread inputThread,
         IoThread ioThread,
         NetworkThread networkThread,
+        PhysicsThread physicsThread,
+        AudioThread audioThread,
         ConsoleCommandSource consoleSource,
         RconServer rconServer,
         WebCommandSource? webSource,
         DatabaseCommandSource? databaseSource,
+        McpServerThread? mcpServer,
+        CvarRegistry cvars,
         CommandSelfTest? selfTest,
-                StrongBox<long> inputCommandsObserved,
-                ThreadTimerRegistry timers
+        StrongBox<long> inputCommandsObserved,
+        StrongBox<string?> physicsFault,
+        StrongBox<string?> networkFault,
+        ThreadTimerRegistry timers
     )
     {
         _options = options;
@@ -133,18 +162,24 @@ public sealed class Engine : IDisposable, ICommandHandler
         _inputThread = inputThread;
         _ioThread = ioThread;
         _networkThread = networkThread;
+        _physicsThread = physicsThread;
+        _audioThread = audioThread;
         _consoleSource = consoleSource;
         _rconServer = rconServer;
         _webSource = webSource;
         _databaseSource = databaseSource;
+        _mcpServer = mcpServer;
+        _cvars = cvars;
         _selfTest = selfTest;
         _inputCommandsObserved = inputCommandsObserved;
+        _physicsFault = physicsFault;
+        _networkFault = networkFault;
         _ticksPerSecond = options.TicksPerSecond;
 
-                _timers = timers;
-                _mainFrameMetrics = timers.Get(ThreadTimerRegistry.Keys.MainFrame);
-                _mainDrainMetrics = timers.Get(ThreadTimerRegistry.Keys.MainDrain);
-                _mainWaitMetrics = timers.Get(ThreadTimerRegistry.Keys.MainWaitForRender);
+        _timers = timers;
+        _mainFrameMetrics = timers.Get(ThreadTimerRegistry.Keys.MainFrame);
+        _mainDrainMetrics = timers.Get(ThreadTimerRegistry.Keys.MainDrain);
+        _mainWaitMetrics = timers.Get(ThreadTimerRegistry.Keys.MainWaitForRender);
     }
 
     public static Engine Create(EngineOptions options)
@@ -154,9 +189,8 @@ public sealed class Engine : IDisposable, ICommandHandler
         // The bus is created before the GLFW callbacks are wired, because the callbacks post to it.
         var commandBus = new CommandBus();
 
-                // One registry shared by every thread, so the debug panel can show their costs side by side.
-                var timers = new ThreadTimerRegistry();
-
+        // One registry shared by every thread, so the debug panel can show their costs side by side.
+        var timers = new ThreadTimerRegistry();
         VulkanRenderer? renderer = null;
         DebugUi? debugUi = null;
         RenderThread? renderThread = null;
@@ -164,23 +198,38 @@ public sealed class Engine : IDisposable, ICommandHandler
         InputThread? inputThread = null;
         IoThread? ioThread = null;
         NetworkThread? networkThread = null;
+        PhysicsThread? physicsThread = null;
+        AudioThread? audioThread = null;
         ConsoleCommandSource? consoleSource = null;
         RconServer? rconServer = null;
         WebCommandSource? webSource = null;
         DatabaseCommandSource? databaseSource = null;
+        McpServerThread? mcpServer = null;
         CommandSelfTest? selfTest = null;
         var bindings = KeyBindings.CreateDefault();
+
+        // The variable registry is created before anything that registers into it, and is handed to the MCP
+        // server so a client reads the same values the debug panel shows rather than a parallel copy.
+        var cvars = new CvarRegistry();
 
         // The key callback runs on the main thread before the Engine exists, so the count it maintains lives
         // in a box the Engine later reads for the console panel.
         var inputCommandsObserved = new StrongBox<long>(0);
+
+        // The fault subscriptions are wired before the Engine exists, so the messages they record live in
+        // boxes the Engine later reads. A worker that faults stops its loop, so one slot per thread is enough.
+        var physicsFault = new StrongBox<string?>(null);
+        var networkFault = new StrongBox<string?>(null);
 
         try
         {
             renderer = VulkanRenderer.Create(
                 window.Handle,
                 new int2(options.Width, options.Height),
-                options.EnableValidation
+                options.EnableValidation,
+                options.EnableTracing,
+                options.EnableRenderDoc,
+                options.CaptureDirectory
             );
 
             // The ImGui context and its GLFW backend must be created on the main thread, before the render
@@ -189,7 +238,41 @@ public sealed class Engine : IDisposable, ICommandHandler
 
             inputThread = new InputThread(commandBus, timers);
             ioThread = new IoThread(timers);
-            networkThread = new NetworkThread(commandBus, timers);
+
+            // The engine only ever sees INetworkTransport; which library carries the bytes is the host's
+            // choice and is decided here, at the single composition root.
+            networkThread = new NetworkThread(
+                commandBus,
+                timers,
+                (options.TransportFactory ?? NetworkTransports.RakNet)(),
+                options.NetworkPort
+            );
+
+            // Physics and audio are separate services on separate threads: each has its own clock, and neither
+            // may make a frame or a tick wait on it. The backends are chosen here, at the one composition root.
+            physicsThread = new PhysicsThread(
+                commandBus,
+                (options.PhysicsFactory ?? PhysicsWorlds.None)(),
+                timers
+            );
+            audioThread = new AudioThread(commandBus, (options.AudioFactory ?? AudioSystems.Fmod)(), timers);
+
+            // A worker that faults stops its own loop, so without a subscription the failure is silent: the
+            // thread simply stops stepping and the engine keeps running with a dead subsystem. These handlers
+            // run on the faulting thread, so they only log and record a message; the main thread reads the
+            // message and surfaces it in the debug panel and the status summary.
+            physicsThread.Faulted += exception =>
+            {
+                physicsFault.Value = exception.Message;
+                if (EngineLog.Categories.Engine.IsEnabled(MSLogLevel.Error))
+                    EngineLog.Categories.Engine.Error(exception, $"physics thread faulted: {exception.Message}");
+            };
+            networkThread.Faulted += exception =>
+            {
+                networkFault.Value = exception.Message;
+                if (EngineLog.Categories.Engine.IsEnabled(MSLogLevel.Error))
+                    EngineLog.Categories.Engine.Error(exception, $"network thread faulted: {exception.Message}");
+            };
 
             // GLFW callbacks run on the main thread and must return immediately, so each one only translates
             // the callback into a command and posts it. From here on they are indistinguishable from the
@@ -226,8 +309,8 @@ public sealed class Engine : IDisposable, ICommandHandler
                 () => inputThread.EventCount,
                 () => ioThread.CompletedCount,
                 () => networkThread.ReceivedCount,
-                                () => commandBus.PendingCount,
-                                timers
+                () => commandBus.PendingCount,
+                timers
             );
 
             consoleSource = new ConsoleCommandSource(commandBus);
@@ -244,10 +327,55 @@ public sealed class Engine : IDisposable, ICommandHandler
 
             if (options.RunCommandSelfTest)
                 selfTest = new CommandSelfTest(commandBus, rconServer, networkThread, webSource, databaseSource);
+
+            // The MCP server is a source like any other: it parses text and posts commands. It is started last
+            // so every subsystem it can report on already exists, and it is opt-in so a normal run never opens
+            // a listener.
+            if (options.McpPort is { } mcpPort)
+            {
+                RegisterCvars(
+                    cvars,
+                    renderer,
+                    window,
+                    commandBus,
+                    renderThread,
+                    simulationThread,
+                    inputThread,
+                    ioThread,
+                    networkThread,
+                    physicsThread,
+                    audioThread,
+                    rconServer,
+                    webSource,
+                    databaseSource,
+                    timers
+                );
+
+                mcpServer = new McpServerThread(
+                    cvars,
+                    commandBus,
+                    () => BuildStatus(
+                        window,
+                        commandBus,
+                        renderThread,
+                        simulationThread,
+                        networkThread,
+                        physicsThread,
+                        audioThread,
+                        renderer,
+                        timers,
+                        physicsFault,
+                        networkFault
+                    ),
+                    mcpPort,
+                    timers
+                );
+            }
         }
         catch
         {
             selfTest?.Dispose();
+            mcpServer?.Dispose();
             databaseSource?.Dispose();
             webSource?.Dispose();
             rconServer?.Dispose();
@@ -257,6 +385,8 @@ public sealed class Engine : IDisposable, ICommandHandler
             networkThread?.Dispose();
             ioThread?.Dispose();
             inputThread?.Dispose();
+            physicsThread?.Dispose();
+            audioThread?.Dispose();
             debugUi?.Dispose();
             renderer?.Dispose();
             window.Dispose();
@@ -276,6 +406,29 @@ public sealed class Engine : IDisposable, ICommandHandler
             Console.WriteLine($"Commands: web on http://127.0.0.1:{webSource.Port}/?cmd=...");
         if (databaseSource is not null)
             Console.WriteLine($"Commands: database table '{databaseSource.Table}' in {databaseSource.DatabasePath}");
+        if (mcpServer is not null)
+        {
+            Console.WriteLine(
+                $"MCP: http://127.0.0.1:{mcpServer.Port}/ exposing {mcpServer.CvarCount} variable(s) "
+                    + "and the command grammar"
+            );
+        }
+
+        // The banner goes to stdout unconditionally: it is the first thing a developer reads and it must not be
+        // filtered by a log level. Everything after startup goes through the async log pipeline, so a thread in
+        // a hot loop is never blocked writing diagnostics.
+        var engineLog = EngineLog.Categories.Engine;
+        if (engineLog.IsEnabled(MSLogLevel.Information))
+        {
+            engineLog.Info(
+                $"engine started: device '{renderer.DeviceName}', swapchain "
+                    + $"{renderer.Extent.Width}x{renderer.Extent.Height} ({renderer.ImageCount} images), "
+                    + $"window mode {window.Mode}"
+            );
+            engineLog.Info(
+                $"threads: main, sim, render, input, io, net ({networkThread.Transport.Name}), console, rcon"
+            );
+        }
 
         Console.WriteLine(CommandParser.HelpText);
 
@@ -290,13 +443,19 @@ public sealed class Engine : IDisposable, ICommandHandler
             inputThread,
             ioThread,
             networkThread,
+            physicsThread,
+            audioThread,
             consoleSource,
             rconServer,
             webSource,
             databaseSource,
+            mcpServer,
+            cvars,
             selfTest,
-                        inputCommandsObserved,
-                        timers
+            inputCommandsObserved,
+            physicsFault,
+            networkFault,
+            timers
         );
     }
 
@@ -315,10 +474,37 @@ public sealed class Engine : IDisposable, ICommandHandler
     /// <summary>Result of the command self-test, or <c>null</c> when it was not requested.</summary>
     public CommandSelfTest? SelfTest => _selfTest;
 
-        /// <summary>
-        /// Per-thread timing for the session, so a host can log or chart it without reaching into the threads.
-        /// </summary>
-        public ThreadTimerRegistry Timers => _timers;
+    /// <summary>
+    /// The most recent physics thread failure, or <c>null</c> when it has not faulted.
+    /// </summary>
+    /// <remarks>
+    /// A faulted worker stops its own loop, so this is the only way a host learns that physics or networking
+    /// has stopped doing its job. The debug panel and the MCP status summary read the same value.
+    /// </remarks>
+    public string? PhysicsFault => _physicsFault.Value;
+
+    /// <summary>The most recent network thread failure, or <c>null</c> when it has not faulted.</summary>
+    public string? NetworkFault => _networkFault.Value;
+
+    /// <summary>
+    /// Per-thread timing for the session, so a host can log or chart it without reaching into the threads.
+    /// </summary>
+    public ThreadTimerRegistry Timers => _timers;
+
+    /// <summary>
+    /// The RenderDoc API the renderer loaded, for a host that wants to query or drive captures.
+    /// </summary>
+    public RenderDocCapture Capture => _renderer.Capture;
+
+    /// <summary>
+    /// The engine's readable variables, for a host that wants to inspect or expose them.
+    /// </summary>
+    public CvarRegistry Cvars => _cvars;
+
+    /// <summary>
+    /// The MCP server, or <c>null</c> when it was not enabled.
+    /// </summary>
+    public McpServerThread? Mcp => _mcpServer;
 
     /// <summary>
     /// Runs the main thread loop until the window closes or the configured frame limit is reached, and
@@ -328,7 +514,7 @@ public sealed class Engine : IDisposable, ICommandHandler
     {
         while (!_window.ShouldClose && (_options.FrameLimit is not { } limit || FrameCount < limit))
         {
-                    var frameStartedAt = Stopwatch.GetTimestamp();
+            var frameStartedAt = Stopwatch.GetTimestamp();
 
             _window.PollEvents();
 
@@ -337,7 +523,7 @@ public sealed class Engine : IDisposable, ICommandHandler
             var drainStartedAt = Stopwatch.GetTimestamp();
             var applied = _commandBus.Drain(CommandTarget.Engine, this, MaxCommandsPerFrame);
             var drainMilliseconds = Stopwatch.GetElapsedTime(drainStartedAt).TotalMilliseconds;
-                    _mainDrainMetrics.Record(drainMilliseconds);
+            _mainDrainMetrics.Record(drainMilliseconds);
 
             // Read the mode-change flag after the drain, because that is when the toggle is applied. It only
             // needs to cover this frame's drain, so it is cleared here.
@@ -355,9 +541,12 @@ public sealed class Engine : IDisposable, ICommandHandler
             // drain here is expected on those frames. Warn only when nothing structural happened, which is
             // the case where a handler is genuinely stalling the frame.
             if (drainMilliseconds >= SlowDrainWarningMilliseconds && !swapchainRebuilt)
-                Console.Error.WriteLine(
-                    $"engine command drain took {drainMilliseconds:0.0} ms for {applied} command(s)"
-                );
+            {
+                if (_log.IsEnabled(MSLogLevel.Warning))
+                    _log.Warning(
+                        $"engine command drain took {drainMilliseconds:0.0} ms for {applied} command(s)"
+                    );
+            }
 
             _rconServer.Broadcast(_lastNotice ?? string.Empty);
             _lastNotice = null;
@@ -371,7 +560,7 @@ public sealed class Engine : IDisposable, ICommandHandler
             {
                 _renderThread.RequestResize(framebufferSize);
                 Thread.Sleep(MinimisedPollDelayMs);
-                            _mainFrameMetrics.RecordSince(frameStartedAt);
+                _mainFrameMetrics.RecordSince(frameStartedAt);
                 continue;
             }
 
@@ -398,13 +587,13 @@ public sealed class Engine : IDisposable, ICommandHandler
             // building the next one: ImGui is single-context, so the two threads must not overlap.
             _renderThread.SubmitFrame(_debugUi.DrawData, snapshot, framebufferSize);
 
-                        // Timed separately because this is the main thread blocked on another thread's work, which is
-                        // the single largest cost in the frame and the one worth distinguishing from its own work.
-                        var waitStartedAt = Stopwatch.GetTimestamp();
+            // Timed separately because this is the main thread blocked on another thread's work, which is
+            // the single largest cost in the frame and the one worth distinguishing from its own work.
+            var waitStartedAt = Stopwatch.GetTimestamp();
             _renderThread.WaitForFrameConsumed(FrameConsumeTimeoutMs);
-                        _mainWaitMetrics.RecordSince(waitStartedAt);
+            _mainWaitMetrics.RecordSince(waitStartedAt);
 
-                        _mainFrameMetrics.RecordSince(frameStartedAt);
+            _mainFrameMetrics.RecordSince(frameStartedAt);
         }
 
         return FrameCount;
@@ -424,6 +613,7 @@ public sealed class Engine : IDisposable, ICommandHandler
         _rconServer.Dispose();
         _webSource?.Dispose();
         _databaseSource?.Dispose();
+        _mcpServer?.Dispose();
 
         _commandBus.Complete();
 
@@ -431,6 +621,13 @@ public sealed class Engine : IDisposable, ICommandHandler
         _inputThread.Dispose();
         _networkThread.Dispose();
         _ioThread.Dispose();
+
+        // Physics and audio own native resources — a Jolt world and an FMOD device — so they are disposed
+        // here rather than left to the finalizer. They are stopped after the bus is completed so no new
+        // command can arrive while they are shutting down.
+        _physicsThread.Dispose();
+        _audioThread.Dispose();
+
         _renderThread.Dispose();
 
         // Reverse creation order: the ImGui context references the render pass and the window.
@@ -516,7 +713,8 @@ public sealed class Engine : IDisposable, ICommandHandler
 
     void ICommandHandler.Handle(FocusCommand command) => Ignore();
 
-    // Simulation commands belong to the simulation thread.
+    // Simulation commands belong to the simulation thread, physics commands to the physics thread and audio
+    // commands to the audio thread.
 
     void ICommandHandler.Handle(StepSimulationCommand command) => Ignore();
 
@@ -524,11 +722,283 @@ public sealed class Engine : IDisposable, ICommandHandler
 
     void ICommandHandler.Handle(ResetSimulationCommand command) => Ignore();
 
+    void ICommandHandler.Handle(AddBodyCommand command) => Ignore();
+
+    void ICommandHandler.Handle(SetGravityCommand command) => Ignore();
+
+    void ICommandHandler.Handle(SetVolumeCommand command) => Ignore();
+
     void ICommandHandler.Handle(UnhandledCommand command) => _lastNotice = command.Describe();
+
+    /// <summary>
+    /// Asks the render thread to capture the next frame. Fails with a notice rather than a fault when
+    /// RenderDoc is not attached, because "no capture tool" is a normal state, not an error.
+    /// </summary>
+    void ICommandHandler.Handle(CaptureFrameCommand command)
+    {
+        var triggered = _renderThread.RequestCapture();
+
+        _lastNotice = triggered
+        ? "capture triggered for the next frame"
+        : "capture unavailable: RenderDoc is not attached";
+
+        // Only the failure is logged here. A successful trigger is already logged by the capture wrapper, which
+        // knows the RenderDoc version and the destination; logging it again produced two identical lines and
+        // made a single `capture` look like it happened twice.
+        if (!triggered && _log.IsEnabled(MSLogLevel.Debug))
+            _log.Debug("capture requested but unavailable: RenderDoc is not attached");
+    }
+
+    void ICommandHandler.Handle(SetLogLevelCommand command)
+    {
+        if (!TryParseLogLevel(command.Level, out var level))
+        {
+            _lastNotice = $"unknown log level '{command.Level}'";
+
+            if (_log.IsEnabled(MSLogLevel.Warning))
+                _log.Warning(_lastNotice);
+
+            return;
+        }
+
+        EngineLog.MinimumLevel = level;
+        _lastNotice = $"log level now {level}";
+
+        // Logged after the switch, so raising the level takes effect on this message itself.
+        if (_log.IsEnabled(MSLogLevel.Information))
+            _log.Info(_lastNotice);
+    }
+
+    private static bool TryParseLogLevel(string value, out Serilog.Events.LogEventLevel level)
+    {
+        switch (value.ToLowerInvariant())
+        {
+            case "verbose" or "trace":
+                level = Serilog.Events.LogEventLevel.Verbose;
+                return true;
+            case "debug":
+                level = Serilog.Events.LogEventLevel.Debug;
+                return true;
+            case "information" or "info":
+                level = Serilog.Events.LogEventLevel.Information;
+                return true;
+            case "warning" or "warn":
+                level = Serilog.Events.LogEventLevel.Warning;
+                return true;
+            case "error":
+                level = Serilog.Events.LogEventLevel.Error;
+                return true;
+            case "fatal" or "critical":
+                level = Serilog.Events.LogEventLevel.Fatal;
+                return true;
+            default:
+                level = default;
+                return false;
+        }
+    }
 
     private static void Ignore()
     {
         // Nothing to do: the command is not addressed to this thread.
+    }
+
+    /// <summary>
+    /// Registers every readable engine variable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Registration is a delegate per variable rather than a value, so a reader always sees the engine as it
+    /// is at the moment it is asked. That is what makes the MCP surface live rather than a startup snapshot,
+    /// and it is why the same accessors the debug panel uses are the ones registered here: there is one
+    /// definition of each number, not two that can disagree.
+    /// </para>
+    /// <para>
+    /// The per-thread timings are registered as a group, one variable per metric, because "which thread is
+    /// costing me this frame" is the question a client is most likely to ask and it needs the numbers side by
+    /// side rather than behind a single opaque blob.
+    /// </para>
+    /// </remarks>
+    private static void RegisterCvars(
+        CvarRegistry cvars,
+        VulkanRenderer renderer,
+        Window window,
+        CommandBus bus,
+        RenderThread renderThread,
+        SimulationThread simulationThread,
+        InputThread inputThread,
+        IoThread ioThread,
+        NetworkThread networkThread,
+        PhysicsThread physicsThread,
+        AudioThread audioThread,
+        RconServer rconServer,
+        WebCommandSource? webSource,
+        DatabaseCommandSource? databaseSource,
+        ThreadTimerRegistry timers
+    )
+    {
+        cvars.RegisterValue("engine.frames", () => renderThread.FramesRendered, "long", "Frames the render thread has presented.");
+        cvars.RegisterValue("engine.ticks", () => simulationThread.TickCount, "long", "Simulation ticks executed.");
+        cvars.RegisterValue("engine.tickRate", () => simulationThread.FixedDeltaSeconds > 0 ? 1.0 / simulationThread.FixedDeltaSeconds : 0.0, "double", "The simulation's configured fixed tick rate in Hz.");
+        cvars.RegisterValue("engine.droppedTicks", () => simulationThread.DroppedTicks, "long", "Ticks dropped because the simulation fell behind.");
+        cvars.RegisterValue("engine.entities", () => simulationThread.EntityCount, "int", "Live entities in the simulation's data-oriented entity store.");
+        cvars.RegisterValue("engine.paused", () => simulationThread.IsPaused, "bool", "True while the passage of simulated time is halted.");
+        cvars.Register("engine.windowMode", () => window.Mode.ToString(), "string", "The current window mode.");
+        cvars.Register("engine.framebuffer", () => $"{window.FramebufferSize.X}x{window.FramebufferSize.Y}", "string", "The window's framebuffer size in pixels.");
+        cvars.Register("engine.swapchain", () => $"{renderer.Extent.Width}x{renderer.Extent.Height}", "string", "The swapchain extent in pixels.");
+        cvars.RegisterValue("engine.swapchainImages", () => renderer.ImageCount, "int", "Number of images in the swapchain.");
+        cvars.Register("engine.device", () => renderer.DeviceName, "string", "The Vulkan device the renderer is using.");
+
+        cvars.RegisterValue("cmd.accepted", () => bus.AcceptedCount, "long", "Commands accepted from every source.");
+        cvars.RegisterValue("cmd.pending", () => bus.PendingCount, "int", "Commands accepted but not yet applied.");
+        cvars.RegisterValue("cmd.applied.engine", () => bus.AppliedCount(CommandTarget.Engine), "long", "Engine commands the main thread has applied.");
+        cvars.RegisterValue("cmd.applied.input", () => bus.AppliedCount(CommandTarget.Input), "long", "Input commands the input thread has applied.");
+        cvars.RegisterValue("cmd.applied.simulation", () => bus.AppliedCount(CommandTarget.Simulation), "long", "Simulation commands the simulation thread has applied.");
+        cvars.RegisterValue("cmd.applied.physics", () => bus.AppliedCount(CommandTarget.Physics), "long", "Physics commands the physics thread has applied.");
+        cvars.RegisterValue("cmd.applied.audio", () => bus.AppliedCount(CommandTarget.Audio), "long", "Audio commands the audio thread has applied.");
+        cvars.RegisterValue("cmd.logOverwritten", () => bus.Log.OverwrittenCount, "long", "Commands discarded from the log because it was full.");
+
+        cvars.RegisterValue("input.commands", () => inputThread.EventCount, "long", "Input commands the input thread has applied.");
+        cvars.RegisterValue("io.jobs", () => ioThread.CompletedCount, "long", "IO jobs the IO thread has completed.");
+        cvars.Register("net.transport", () => networkThread.Transport.Name, "string", "The name of the network transport in use.");
+        cvars.Register("net.endpoint", () => networkThread.LocalEndPoint.ToString(), "string", "The endpoint the network transport is bound to.");
+        cvars.RegisterValue("net.received", () => networkThread.ReceivedCount, "long", "Messages the network thread has received.");
+        cvars.RegisterValue("net.commands", () => networkThread.CommandsPosted, "long", "Commands decoded from network datagrams.");
+        cvars.RegisterValue("net.rejected", () => networkThread.RejectedCount, "long", "Datagrams that could not be decoded.");
+
+        cvars.Register("phys.backend", () => physicsThread.World.Name, "string", "The name of the physics backend.");
+        cvars.RegisterValue("phys.available", () => physicsThread.World.IsAvailable, "bool", "True when the physics backend initialized and can be stepped.");
+        cvars.RegisterValue("phys.bodies", () => physicsThread.World.BodyCount, "int", "Bodies currently in the physics world.");
+        cvars.RegisterValue("phys.steps", () => physicsThread.World.StepCount, "long", "Physics steps performed this session.");
+        cvars.Register("audio.backend", () => audioThread.Audio.Name, "string", "The name of the audio backend.");
+        cvars.RegisterValue("audio.available", () => audioThread.Audio.IsAvailable, "bool", "True when an audio device was opened.");
+        cvars.RegisterValue("audio.channels", () => audioThread.Audio.PlayingChannels, "int", "Channels the mixer is currently playing.");
+        cvars.RegisterValue("audio.updates", () => audioThread.Audio.UpdateCount, "long", "Mixer updates performed this session.");
+
+        cvars.RegisterValue("rcon.port", () => rconServer.Port, "int", "Loopback port of the remote console listener.");
+        cvars.RegisterValue("rcon.clients", () => rconServer.ClientCount, "int", "Clients currently connected to the remote console.");
+        cvars.RegisterValue("rcon.lines", () => rconServer.LinesPosted, "long", "Lines received over the remote console.");
+        cvars.RegisterValue("web.port", () => webSource?.Port ?? 0, "int", "Web listener port, or 0 when it is off.");
+        cvars.RegisterValue("web.requests", () => webSource?.RequestCount ?? 0, "long", "HTTP requests the web listener has received.");
+        cvars.RegisterValue("web.commands", () => webSource?.CommandsPosted ?? 0, "long", "Commands posted from web requests.");
+        cvars.RegisterValue("db.commands", () => databaseSource?.CommandsPosted ?? 0, "long", "Commands posted from watched database rows.");
+        cvars.RegisterValue("db.polls", () => databaseSource?.PollCount ?? 0, "long", "Completed database poll cycles.");
+        cvars.RegisterValue("db.failures", () => databaseSource?.FailureCount ?? 0, "long", "Database polls that threw.");
+
+        cvars.Register("log.level", () => EngineLog.MinimumLevel.ToString(), "string", "The log pipeline's current minimum level.");
+        cvars.RegisterValue("log.dropped", () => EngineLog.DroppedCount, "long", "Log events dropped because the asynchronous buffer was full.");
+        cvars.RegisterValue("renderdoc.available", () => renderer.Capture.IsAvailable, "bool", "True when RenderDoc's in-application API is attached.");
+        cvars.Register("renderdoc.version", () => renderer.Capture.ApiVersionNumber?.ToString() ?? "none", "string", "The RenderDoc API version, or 'none'.");
+        cvars.RegisterValue("renderdoc.captures", () => renderer.Capture.CaptureCount, "uint", "Captures RenderDoc has written this session.");
+
+        // One variable per metric, so a client can read a single thread's cost without parsing a blob.
+        // The MCP metrics are resolved first because the MCP thread is created after this registration runs,
+        // so they would otherwise be missing from the snapshot the loop below walks.
+        _ = timers.Get(ThreadTimerRegistry.Keys.McpPoll);
+        _ = timers.Get(ThreadTimerRegistry.Keys.McpRequest);
+
+        foreach (var (key, metrics) in timers.Snapshot())
+        {
+            var name = key;
+            cvars.RegisterValue(
+                $"timing.{name}.mean",
+                () => metrics.MeanMilliseconds,
+                "double",
+                $"Mean duration of '{name}' over its rolling window, in milliseconds."
+            );
+            cvars.RegisterValue(
+                $"timing.{name}.p99",
+                () => metrics.PercentileMilliseconds(0.99),
+                "double",
+                $"Estimated p99 duration of '{name}', in milliseconds."
+            );
+            cvars.RegisterValue(
+                $"timing.{name}.max",
+                () => metrics.MaxMilliseconds,
+                "double",
+                $"Slowest '{name}' seen this session, in milliseconds."
+            );
+            cvars.RegisterValue(
+                $"timing.{name}.samples",
+                () => metrics.Samples,
+                "long",
+                $"Number of '{name}' samples recorded."
+            );
+        }
+
+        cvars.RegisterValue(
+            "log.retained",
+            () => EngineLog.RecentEvents.Count,
+            "int",
+            "Log events currently held for the debug window."
+        );
+
+        cvars.RegisterValue(
+            "log.overwritten",
+            () => EngineLog.RecentEvents.OverwrittenCount,
+            "long",
+            "Log events overwritten in the debug window's ring buffer because it was full."
+        );
+
+        // Registered last so it sees every variable above, including the per-thread timings. It excludes
+        // itself by name: its reader walks the registry, so without the exclusion reading 'help' would
+        // re-enter its own reader and recurse until the stack ran out.
+        cvars.Register(
+            "help",
+            () => cvars.DescribeAll("help"),
+            "string",
+            "Every other engine variable and its current value, one per line."
+        );
+    }
+
+    /// <summary>
+    /// Builds the one-call status summary the MCP server serves.
+    /// </summary>
+    /// <remarks>
+    /// Called on the MCP thread, so it reads only through accessors that are safe from any thread and copies
+    /// everything into a value. It never touches the window, ImGui or the renderer's mutable state.
+    /// </remarks>
+    private static EngineStatus BuildStatus(
+        Window window,
+        CommandBus bus,
+        RenderThread renderThread,
+        SimulationThread simulationThread,
+        NetworkThread networkThread,
+        PhysicsThread physicsThread,
+        AudioThread audioThread,
+        VulkanRenderer renderer,
+        ThreadTimerRegistry timers,
+        StrongBox<string?> physicsFault,
+        StrongBox<string?> networkFault
+    )
+    {
+        var timings = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (var (key, metrics) in timers.Snapshot())
+        {
+            timings[key] =
+                $"mean {metrics.MeanMilliseconds:0.000} ms, p99 {metrics.PercentileMilliseconds(0.99):0.000} ms, "
+                + $"max {metrics.MaxMilliseconds:0.000} ms, {metrics.Samples} sample(s)";
+        }
+
+        return new EngineStatus(
+            renderThread.FramesRendered,
+            simulationThread.TickCount,
+            simulationThread.FixedDeltaSeconds > 0 ? 1.0 / simulationThread.FixedDeltaSeconds : 0.0,
+            bus.AcceptedCount,
+            bus.PendingCount,
+            window.Mode.ToString(),
+            networkThread.Transport.Name,
+            networkThread.LocalEndPoint.ToString(),
+            physicsThread.World.Name,
+            physicsThread.World.IsAvailable,
+            audioThread.Audio.Name,
+            audioThread.Audio.IsAvailable,
+            renderer.Capture.IsAvailable,
+            EngineLog.MinimumLevel.ToString(),
+            timings,
+            physicsFault.Value,
+            networkFault.Value
+        );
     }
 
     private SimulationSnapshot ReadSimulationSnapshot()
@@ -553,11 +1023,15 @@ public sealed class Engine : IDisposable, ICommandHandler
     private ConsoleState BuildConsoleState()
     {
         var count = _commandBus.Log.Snapshot(_logBuffer);
+        var logEventCount = EngineLog.RecentEvents.Snapshot(_logEventBuffer);
 
         return new ConsoleState
         {
             Commands = _logBuffer,
             CommandCount = count,
+            LogEvents = _logEventBuffer,
+            LogEventCount = logEventCount,
+            LogEventOverwrittenCount = EngineLog.RecentEvents.OverwrittenCount,
             AcceptedCount = _commandBus.AcceptedCount,
             PendingCount = _commandBus.PendingCount,
             EngineAppliedCount = EngineCommandsApplied,
@@ -578,10 +1052,32 @@ public sealed class Engine : IDisposable, ICommandHandler
             DatabasePolls = _databaseSource?.PollCount ?? 0,
             DatabaseFailures = _databaseSource?.FailureCount ?? 0,
             DatabaseError = _databaseSource?.LastError,
+            McpPort = _mcpServer?.Port,
+            McpCvarCount = _mcpServer?.CvarCount ?? 0,
+            McpRequests = _mcpServer?.RequestCount ?? 0,
+            McpCommands = _mcpServer?.CommandsPosted ?? 0,
             InputCommandsObserved = _inputCommandsObserved.Value,
             LastEngineDrainMilliseconds = _lastEngineDrainMilliseconds,
             MaxEngineDrainMilliseconds = _maxEngineDrainMilliseconds,
-                        ThreadTimings = _timers.Snapshot(),
+            PhysicsFault = _physicsFault.Value,
+            PhysicsBackend = _physicsThread.World.Name,
+            PhysicsAvailable = _physicsThread.World.IsAvailable,
+            PhysicsBodies = _physicsThread.World.BodyCount,
+            PhysicsSteps = _physicsThread.World.StepCount,
+            AudioBackend = _audioThread.Audio.Name,
+            AudioAvailable = _audioThread.Audio.IsAvailable,
+            AudioChannels = _audioThread.Audio.PlayingChannels,
+            AudioUpdates = _audioThread.Audio.UpdateCount,
+            ThreadTimings = _timers.Snapshot(),
+            NetworkTransport = _networkThread.Transport.Name,
+            NetworkEndpoint = _networkThread.LocalEndPoint.ToString(),
+            NetworkFault = _networkFault.Value,
+            TracingEnabled = _options.EnableTracing,
+            RenderDocAvailable = _renderer.Capture.IsAvailable,
+            RenderDocVersion = _renderer.Capture.ApiVersionNumber?.ToString(),
+            CaptureCount = _renderer.Capture.CaptureCount,
+            LogLevel = EngineLog.MinimumLevel.ToString(),
+            LogDroppedCount = EngineLog.DroppedCount,
         };
     }
 }

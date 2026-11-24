@@ -47,16 +47,17 @@ public sealed class RenderThread : IDisposable
     private int2 _pendingSize;
     private bool _hasPendingFrame;
     private long _framesRendered;
+    private volatile bool _captureRequested;
     private volatile bool _disposed;
 
     public RenderThread(VulkanRenderer renderer, ThreadTimerRegistry timers)
     {
-            ArgumentNullException.ThrowIfNull(renderer);
-            ArgumentNullException.ThrowIfNull(timers);
+        ArgumentNullException.ThrowIfNull(renderer);
+        ArgumentNullException.ThrowIfNull(timers);
 
         _renderer = renderer;
         _gui = new ImGuiVulkanRenderer(renderer);
-            _frameMetrics = timers.Get(ThreadTimerRegistry.Keys.RenderFrame);
+        _frameMetrics = timers.Get(ThreadTimerRegistry.Keys.RenderFrame);
 
         _thread = new Thread(Run)
         {
@@ -96,6 +97,24 @@ public sealed class RenderThread : IDisposable
     /// <summary>Requests a swapchain rebuild for the given framebuffer size.</summary>
     public void RequestResize(int2 framebufferSize) => _renderer.RequestResize(framebufferSize);
 
+    /// <summary>
+    /// Asks RenderDoc to capture the next frame.
+    /// </summary>
+    /// <remarks>
+    /// The request is a flag rather than a direct call, so the capture is triggered on the render thread at a
+    /// frame boundary. Calling <c>StartFrameCapture</c> from the main thread would race the render thread's own
+    /// frame and could open a capture in the middle of one. Safe from any thread; returns false when RenderDoc
+    /// is not attached.
+    /// </remarks>
+    public bool RequestCapture()
+    {
+        if (!_renderer.Capture.IsAvailable)
+            return false;
+
+        _captureRequested = true;
+        return true;
+    }
+
     private void Run()
     {
         var token = _cancellation.Token;
@@ -122,7 +141,15 @@ public sealed class RenderThread : IDisposable
             _renderer.RequestResize(framebufferSize);
             _gui.SetDrawData(drawData);
 
-                        var frameStartedAt = Stopwatch.GetTimestamp();
+            // Consumed here, immediately before the frame is recorded, so the capture brackets exactly one
+            // complete frame on the thread that owns it.
+            if (_captureRequested)
+            {
+                _captureRequested = false;
+                _renderer.Capture.TriggerCapture();
+            }
+
+            var frameStartedAt = Stopwatch.GetTimestamp();
 
             try
             {
@@ -131,9 +158,9 @@ public sealed class RenderThread : IDisposable
             }
             finally
             {
-                            // Recorded in finally so a frame that threw still contributes its cost: an exception on the
-                            // render thread is exactly the case where the timings matter most.
-                            _frameMetrics.RecordSince(frameStartedAt);
+                // Recorded in finally so a frame that threw still contributes its cost: an exception on the
+                // render thread is exactly the case where the timings matter most.
+                _frameMetrics.RecordSince(frameStartedAt);
 
                 // Always release the main thread, even when the frame was skipped because the
                 // swapchain was out of date or the window was minimised. Otherwise the main thread

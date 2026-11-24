@@ -29,7 +29,8 @@ public static class CommandParser
         "verbs: help | quit | window-mode [windowed|fullscreen|toggle] | tick-rate <hz> | "
         + "key [down|up|repeat] <key> | mouse <down|up> <button> | cursor <x> <y> | "
         + "scroll <x> <y> | text <string> | focus <gained|lost> | inject <command...> | "
-        + "step <ticks> | pause | resume | reset-simulation";
+        + "step <ticks> | pause | resume | reset-simulation | capture | log-level <level> | "
+        + "add-body [static] [r<radius>] [<x> <y> <z>] | gravity <x> <y> <z> | volume <0..1>";
 
     /// <summary>
     /// Parses one line. Anything not understood comes back as an <see cref="UnhandledCommand"/> so the
@@ -64,6 +65,11 @@ public static class CommandParser
             "pause" => new SetPausedCommand { Source = source, Paused = true },
             "resume" => new SetPausedCommand { Source = source, Paused = false },
             "reset-simulation" => new ResetSimulationCommand { Source = source },
+            "capture" => new CaptureFrameCommand { Source = source },
+            "log-level" => ParseLogLevel(rest, source, trimmed),
+            "add-body" => ParseAddBody(rest, source, trimmed),
+            "gravity" => ParseGravity(rest, source, trimmed),
+            "volume" => ParseVolume(rest, source, trimmed),
             _ => new UnhandledCommand
             {
                 Source = source,
@@ -161,6 +167,23 @@ public static class CommandParser
             case ResetSimulationCommand:
                 line = "reset-simulation";
                 return true;
+            case CaptureFrameCommand:
+                line = "capture";
+                return true;
+            case SetLogLevelCommand logLevel:
+                line = $"log-level {logLevel.Level}";
+                return true;
+            case AddBodyCommand addBody:
+                line =
+                    $"add-body{(addBody.IsStatic ? " static" : string.Empty)} "
+                    + $"r{Number(addBody.Radius)} {Number(addBody.X)} {Number(addBody.Y)} {Number(addBody.Z)}";
+                return true;
+            case SetGravityCommand gravity:
+                line = $"gravity {Number(gravity.X)} {Number(gravity.Y)} {Number(gravity.Z)}";
+                return true;
+            case SetVolumeCommand volume:
+                line = $"volume {Number(volume.Volume)}";
+                return true;
             default:
                 line = string.Empty;
                 return false;
@@ -189,6 +212,30 @@ public static class CommandParser
         int.TryParse(rest, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ticks) && ticks > 0
             ? new StepSimulationCommand { Source = source, Ticks = ticks }
             : Malformed(source, original, $"'{rest}' is not a positive tick count");
+
+    /// <summary>
+    /// Parses a log level name. Accepts the Serilog/`Microsoft.Extensions.Logging` names, so the value a
+    /// developer types matches what they read in the configuration.
+    /// </summary>
+    private static Command ParseLogLevel(string rest, CommandSource source, string original)
+    {
+        var level = rest.ToLowerInvariant();
+
+        return level switch
+        {
+            "verbose" or "trace" => new SetLogLevelCommand { Source = source, Level = "verbose" },
+            "debug" => new SetLogLevelCommand { Source = source, Level = "debug" },
+            "info" or "information" => new SetLogLevelCommand { Source = source, Level = "information" },
+            "warn" or "warning" => new SetLogLevelCommand { Source = source, Level = "warning" },
+            "error" => new SetLogLevelCommand { Source = source, Level = "error" },
+            "fatal" or "critical" => new SetLogLevelCommand { Source = source, Level = "fatal" },
+            _ => Malformed(
+                source,
+                original,
+                $"'{rest}' is not a log level (verbose|debug|information|warning|error|fatal)"
+            ),
+        };
+    }
 
     private static Command ParseKey(string rest, CommandSource source, string original)
     {
@@ -293,6 +340,93 @@ public static class CommandParser
 
     private static bool TryParseDouble(string text, out double value) =>
         double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value) && double.IsFinite(value);
+
+    /// <summary>
+    /// Parses <c>add-body</c>, whose arguments are all optional so a bare verb still does something useful.
+    /// </summary>
+    /// <remarks>
+    /// Positional rather than named: <c>add-body static r2 0 10 0</c> reads the way it is typed, and the two
+    /// optional keywords are recognised by shape rather than by order, so leaving the radius out does not turn
+    /// the first coordinate into one.
+    /// </remarks>
+    private static Command ParseAddBody(string rest, CommandSource source, string original)
+    {
+        var parts = Split(rest);
+        var isStatic = false;
+        var radius = 0.5f;
+        var coordinates = new List<double>(3);
+
+        foreach (var part in parts)
+        {
+            if (part.Equals("static", StringComparison.OrdinalIgnoreCase))
+            {
+                isStatic = true;
+                continue;
+            }
+
+            if (part.StartsWith('r') && part.Length > 1 && TryParseDouble(part[1..], out var parsedRadius))
+            {
+                radius = (float)parsedRadius;
+                continue;
+            }
+
+            if (!TryParseDouble(part, out var coordinate))
+                return Malformed(source, original, $"'{part}' is not a coordinate");
+
+            coordinates.Add(coordinate);
+        }
+
+        if (radius <= 0.0f)
+            return Malformed(source, original, "radius must be greater than zero");
+
+        if (coordinates.Count is not (0 or 3))
+            return Malformed(source, original, "expected either no position or 'x y z'");
+
+        return new AddBodyCommand
+        {
+            Source = source,
+            IsStatic = isStatic,
+            Radius = radius,
+            X = coordinates.Count == 3 ? (float)coordinates[0] : 0.0f,
+            Y = coordinates.Count == 3 ? (float)coordinates[1] : 5.0f,
+            Z = coordinates.Count == 3 ? (float)coordinates[2] : 0.0f,
+        };
+    }
+
+    private static Command ParseGravity(string rest, CommandSource source, string original)
+    {
+        var parts = Split(rest);
+        if (parts.Length != 3)
+            return Malformed(source, original, "expected 'gravity <x> <y> <z>'");
+
+        if (
+            !TryParseDouble(parts[0], out var x)
+            || !TryParseDouble(parts[1], out var y)
+            || !TryParseDouble(parts[2], out var z)
+        )
+        {
+            return Malformed(source, original, "gravity components must be finite numbers");
+        }
+
+        return new SetGravityCommand
+        {
+            Source = source,
+            X = (float)x,
+            Y = (float)y,
+            Z = (float)z,
+        };
+    }
+
+    private static Command ParseVolume(string rest, CommandSource source, string original) =>
+        TryParseDouble(rest, out var volume) && volume is >= 0.0 and <= 1.0
+            ? new SetVolumeCommand { Source = source, Volume = (float)volume }
+            : Malformed(source, original, "expected 'volume <0..1>'");
+
+    /// <summary>
+    /// Formats a float without trailing zeros, so a round trip produces the same text a developer would type.
+    /// </summary>
+    private static string Number(float value) =>
+        value.ToString("0.###", CultureInfo.InvariantCulture);
 
     private static UnhandledCommand Malformed(CommandSource source, string text, string reason) =>
         new()

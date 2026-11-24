@@ -120,6 +120,56 @@ public class MpscQueueTests
     }
 
     [Test]
+    public void Draining_with_TryDequeue_does_not_leave_a_signal_that_breaks_a_later_wait()
+    {
+        // The bus drains with TryDequeue only. If a successful dequeue did not consume its wake signal,
+        // every posted command would leave one behind and a later WaitDequeue would return immediately
+        // instead of blocking. This is the regression test for that accounting.
+        using var queue = new MpscQueue<int>();
+
+        for (var i = 0; i < 100; i++)
+            queue.Enqueue(i);
+
+        var drained = 0;
+        while (queue.TryDequeue(out _))
+            drained++;
+
+        Assert.That(drained, Is.EqualTo(100));
+
+        var started = Environment.TickCount64;
+        var dequeued = queue.WaitDequeue(out _, 60);
+        var elapsed = Environment.TickCount64 - started;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(dequeued, Is.False);
+            Assert.That(elapsed, Is.GreaterThanOrEqualTo(25), $"returned after only {elapsed}ms");
+        });
+    }
+
+    [Test]
+    public void A_wait_after_a_drain_still_wakes_for_a_new_item()
+    {
+        using var queue = new MpscQueue<int>();
+
+        queue.Enqueue(1);
+        Assert.That(queue.TryDequeue(out var first), Is.True);
+        Assert.That(first, Is.EqualTo(1));
+
+        var producer = new Thread(() =>
+        {
+            Thread.Sleep(40);
+            queue.Enqueue(2);
+        });
+        producer.Start();
+
+        Assert.That(queue.WaitDequeue(out var second, 5000), Is.True);
+        Assert.That(second, Is.EqualTo(2));
+
+        producer.Join();
+    }
+
+    [Test]
     public void Multiple_producers_are_all_drained_without_loss()
     {
         using var queue = new MpscQueue<int>();

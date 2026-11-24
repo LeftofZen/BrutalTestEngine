@@ -6,7 +6,9 @@ using Brutal.Strings;
 using Brutal.VulkanApi;
 using Brutal.VulkanApi.Abstractions;
 using Brutal.VulkanApi.Vma;
+using BrutalTestEngine.Compute;
 using BrutalTestEngine.Shaders;
+using BrutalTestEngine.Logging;
 using BrutalTestEngine.Simulation;
 using System.Runtime.InteropServices;
 
@@ -25,6 +27,17 @@ internal struct TrianglePushConstants
 }
 
 /// <summary>
+/// The push constant block the demo compute shader reads: the element count, the step size, and two floats
+/// of padding. Mirrors the block declared in <see cref="ComputeShaders.FieldStep"/>.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Size = ComputeShaders.FieldStepPushConstantSize)]
+internal struct FieldStepPushConstants
+{
+    public uint ElementCount;
+    public float Step;
+}
+
+/// <summary>
 /// Owns the Vulkan instance, device, swapchain, render pass and the demo triangle pipeline.
 /// The swapchain is rebuilt whenever the window's framebuffer size changes, including when the
 /// window switches between windowed and borderless fullscreen.
@@ -40,6 +53,19 @@ public sealed unsafe class VulkanRenderer : IDisposable
     private const int InitialWidth = 1280;
     private const int InitialHeight = 720;
 
+    /// <summary>
+    /// Elements in the demo compute field. Small enough that the read-back is free, large enough that the
+    /// dispatch spans more than one workgroup, which is the case the group arithmetic has to get right.
+    /// </summary>
+    private const int FieldElementCount = 4096;
+
+    // Label colours are for a human reading a GPU capture: they make the passes visually distinct in
+    // RenderDoc's timeline and Tracy's graph. Values are RGBA in 0..1.
+    private static readonly float4 FrameLabelColor = new(0.35f, 0.45f, 0.65f, 1.0f);
+    private static readonly float4 TriangleLabelColor = new(0.85f, 0.55f, 0.25f, 1.0f);
+    private static readonly float4 ImGuiLabelColor = new(0.35f, 0.75f, 0.45f, 1.0f);
+    private static readonly float4 ComputeLabelColor = new(0.65f, 0.45f, 0.85f, 1.0f);
+
     private readonly Instance _instance;
     private readonly VkSurfaceKHR _surface;
     private readonly PhysicalDevice _physicalDevice;
@@ -52,9 +78,9 @@ public sealed unsafe class VulkanRenderer : IDisposable
     private readonly VkSemaphore[] _imageAvailable;
     private readonly VkFence[] _frameFences;
 
-        // Presentation operations do not retire a signal semaphore, so the render-finished semaphores
-        // must be per swapchain image and rebuilt with it.
-        private VkSemaphore[] _renderFinished = [];
+    // Presentation operations do not retire a signal semaphore, so the render-finished semaphores
+    // must be per swapchain image and rebuilt with it.
+    private VkSemaphore[] _renderFinished = [];
 
     private readonly VmaAllocator _allocator;
     private readonly VkBuffer _vertexBuffer;
@@ -64,12 +90,33 @@ public sealed unsafe class VulkanRenderer : IDisposable
     private readonly VkPipelineLayout _pipelineLayout;
     private readonly VkPipeline _trianglePipeline;
 
+    // The demo compute pass. It exists to prove the abstraction end to end: a real shader, a real dispatch,
+    // and a real read-back, so the weather and NPC passes that follow are a shader swap rather than new
+    // plumbing. It runs once, on the first frame, and then stops.
+    private readonly ComputeShader _fieldStepShader;
+    private readonly ComputePipeline _fieldStepPipeline;
+    private readonly ComputeBuffer<float> _fieldInput;
+    private readonly ComputeBuffer<float> _fieldOutput;
+    private bool _fieldStepPending = true;
+    private bool _fieldStepVerified;
+
     private SwapchainState _swapchain;
     private int2 _framebufferSize;
     private int _frameIndex;
     private bool _swapchainOutOfDate;
     private bool _disposed;
     private readonly VkFormat _format;
+
+    // Tracing is decided once at creation: either the instance was built with VK_EXT_debug_utils or it was
+    // not, and there is no way to add an instance extension afterwards.
+    private readonly bool _tracingEnabled;
+    private readonly Brutal.Logging.LogCategory _log = EngineLog.Categories.Vulkan;
+    private VkDebugUtilsMessengerEXT _debugMessenger;
+
+    /// <summary>
+    /// RenderDoc's in-application API, or a no-op instance when RenderDoc is not loaded.
+    /// </summary>
+    public RenderDocCapture Capture { get; }
 
     // The main thread requests resizes while the render thread renders, so the requested size is
     // handed over through these fields instead of being applied directly. The render thread picks it
@@ -85,7 +132,9 @@ public sealed unsafe class VulkanRenderer : IDisposable
         DeviceEx device,
         Queue queue,
         int queueFamily,
-        int2 requestedSize
+            int2 requestedSize,
+            bool tracingEnabled,
+            RenderDocCapture capture
     )
     {
         _instance = instance;
@@ -94,6 +143,8 @@ public sealed unsafe class VulkanRenderer : IDisposable
         _device = device;
         _queue = queue;
         _queueFamily = queueFamily;
+        _tracingEnabled = tracingEnabled;
+        Capture = capture;
 
         var properties = physicalDevice.GetProperties();
         DeviceName = Utf8.GetString(properties.DeviceName);
@@ -167,6 +218,27 @@ public sealed unsafe class VulkanRenderer : IDisposable
 
         _pipelineLayout = device.CreatePipelineLayout([], [PushConstantRange], null);
         _trianglePipeline = CreateTrianglePipeline(device, _pipelineLayout, _shaderStages, RenderPass);
+
+        _fieldStepShader = new ComputeShader(device, ComputeShaders.FieldStep, "field-step");
+        _fieldInput = new ComputeBuffer<float>(_allocator, FieldElementCount, "field-input");
+        _fieldOutput = new ComputeBuffer<float>(_allocator, FieldElementCount, "field-output");
+        _fieldStepPipeline = new ComputePipeline(
+            device,
+            _allocator,
+            _fieldStepShader,
+            [
+                new ComputeBinding(0, _fieldInput.Buffer, _fieldInput.Size),
+                new ComputeBinding(1, _fieldOutput.Buffer, _fieldOutput.Size),
+            ],
+            ComputeShaders.FieldStepPushConstantSize
+        );
+
+        _fieldInput.Upload(CreateInitialField());
+
+        // Installed last, so a validation message raised while the renderer is being built is reported by the
+        // same pipeline everything else uses.
+        if (tracingEnabled)
+            _debugMessenger = VulkanDebugMessenger.Install(instance);
     }
 
     /// <summary>
@@ -218,13 +290,36 @@ public sealed unsafe class VulkanRenderer : IDisposable
     /// </summary>
     public event Action? SwapchainRecreated;
 
-    public static VulkanRenderer Create(GlfwWindow window, int2 requestedSize, bool enableValidation)
+    /// <summary>
+    /// Creates a renderer for <paramref name="window"/>.
+    /// </summary>
+    /// <param name="window">The window whose surface is rendered into.</param>
+    /// <param name="requestedSize">The initial framebuffer size.</param>
+    /// <param name="enableValidation">Enables the Vulkan validation layer when it is installed.</param>
+    /// <param name="enableTracing">
+    /// Enables <c>VK_EXT_debug_utils</c>, the debug messenger and command-buffer debug labels. This is what
+    /// makes a GPU capture readable: RenderDoc and Tracy both group work by the labels the application emits.
+    /// </param>
+    public static VulkanRenderer Create(
+        GlfwWindow window,
+        int2 requestedSize,
+        bool enableValidation,
+        bool enableTracing = false,
+        bool enableRenderDoc = false,
+        string? captureDirectory = null
+    )
     {
         // GLFW looks for Brutal's own Vulkan loader (libVulkanEx), so touch Vulkan first to load it.
         _ = Vulkan.GetInstanceProcAddr;
 
         if (!Glfw.VulkanSupported())
             throw new InvalidOperationException("Vulkan is not available: no loader or ICD was found");
+
+        // RenderDoc installs its hooks into the Vulkan loader, so it has to happen before the instance exists.
+        // Loading it later attaches but produces captures with no device creation in them, which is the failure
+        // its own documentation warns about. Loading is opt-in because the hooks cost performance and interfere
+        // with the validation layers.
+        var capture = enableRenderDoc ? RenderDocCapture.Load(captureDirectory) : RenderDocCapture.Disabled;
 
         var instanceExtensions = new HashSet<string>();
         VulkanHelpers.AddPlatformRequiredExtensions(instanceExtensions);
@@ -233,9 +328,22 @@ public sealed unsafe class VulkanRenderer : IDisposable
         for (var i = 0; i < glfwExtensionCount; i++)
             instanceExtensions.Add(Utf8.GetString(glfwExtensions[i]));
 
+        // The extension has to be enabled at instance creation and cannot be added later, so whether tracing
+        // was asked for is settled here even though the messenger itself is created afterwards.
+        var tracingEnabled = enableTracing;
+        if (tracingEnabled)
+            VulkanHelpers.AddDebugExtensions(instanceExtensions);
+
         var layers = new HashSet<string>();
-        if (enableValidation && VulkanHelpers.Validation.IsSupported)
+        var validationAvailable = enableValidation && VulkanHelpers.Validation.IsSupported;
+        if (validationAvailable)
             VulkanHelpers.AddValidationLayers(layers);
+
+        var instanceLogger = EngineLog.Categories.Vulkan;
+        if (enableValidation && !validationAvailable)
+            instanceLogger.Warning(
+                "validation layers were requested but are not installed; run with --trace for debug labels only"
+            );
 
         var instance = Vulkan.CreateInstance(
             new Instance.CreateInfo
@@ -275,7 +383,17 @@ public sealed unsafe class VulkanRenderer : IDisposable
 
             var queue = device.GetQueue(queueFamily, 0);
 
-            return new VulkanRenderer(instance, surface, physicalDevice, device, queue, queueFamily, requestedSize);
+            return new VulkanRenderer(
+                instance,
+                surface,
+                physicalDevice,
+                device,
+                queue,
+                queueFamily,
+                requestedSize,
+                tracingEnabled,
+                capture
+            );
         }
         catch
         {
@@ -355,6 +473,17 @@ public sealed unsafe class VulkanRenderer : IDisposable
 
         _device.WaitForFence(fence, -1);
 
+        // The demo compute pass is verified once, on the frame after it was submitted, by reading the result
+        // back and checking it against the same step computed on the CPU. A dispatch that silently does
+        // nothing — a bad descriptor, a zero group count, a shader that returns early — produces no error and
+        // no visible symptom, so the only way to know the abstraction works is to compare the output.
+        if (_fieldStepPending == false && _fieldStepVerified == false)
+        {
+            _device.WaitIdle();
+            VerifyFieldStep();
+            _fieldStepVerified = true;
+        }
+
         // Acquire before resetting the fence, so an out-of-date swapchain doesn't leave it unsignalled.
         int imageIndex;
         try
@@ -373,6 +502,17 @@ public sealed unsafe class VulkanRenderer : IDisposable
         commandBuffer.Reset();
         commandBuffer.Begin(VkCommandBufferUsageFlags.OneTimeSubmitBit);
 
+        // Compute runs before the render pass opens, because a render pass is a graphics-only construct and
+        // a dispatch cannot be recorded inside one. The barrier afterwards is what makes the render pass see
+        // the compute pass's writes.
+        if (_fieldStepPending)
+        {
+            RecordFieldStep(commandBuffer);
+            _fieldStepPending = false;
+        }
+        // Deliberately no StartFrameCapture here. Bracketing every frame writes a capture file per frame —
+        // a 120-frame smoke run produced 120 .rdc files. Captures are requested instead, through the
+        // `capture` command, and RenderDoc picks its own frame boundary for them.
         var extent = _swapchain.Extent;
         var clearValue = new VkClearValue
         {
@@ -390,6 +530,16 @@ public sealed unsafe class VulkanRenderer : IDisposable
             },
             VkSubpassContents.Inline
         );
+
+        // Debug labels bracket the work a GPU capture shows. Without them a RenderDoc or Tracy capture is an
+        // undifferentiated list of draws; with them each pass is named and each is a separate row in the
+        // timeline.
+        //
+        // Opened and closed explicitly rather than with `using`: DebugLabelScope is a struct whose Dispose
+        // calls straight into vkCmdEndDebugUtilsLabelEXT, so the default value is not a safe no-op and cannot
+        // stand in for "tracing is off". The paired calls below keep that unambiguous.
+        if (_tracingEnabled)
+            commandBuffer.BeginDebugLabel("Main pass"u8, FrameLabelColor);
 
         // Viewport and scissor are dynamic, so a resize doesn't invalidate the pipeline.
         var viewport = new VkViewport
@@ -415,9 +565,25 @@ public sealed unsafe class VulkanRenderer : IDisposable
         commandBuffer.PushConstants(_pipelineLayout, VkShaderStageFlags.VertexBit, ByteSize.Zero, pushConstants);
 
         commandBuffer.BindVertexBuffers(0, [_vertexBuffer], [new ByteSize64(0)]);
+
+        if (_tracingEnabled)
+            commandBuffer.BeginDebugLabel("Triangle"u8, TriangleLabelColor);
+
         commandBuffer.Draw(3, 1, 0, 0);
 
+        if (_tracingEnabled)
+            commandBuffer.EndDebugLabel();
+
+        if (_tracingEnabled)
+            commandBuffer.BeginDebugLabel("ImGui"u8, ImGuiLabelColor);
+
         gui.Render(commandBuffer);
+
+        if (_tracingEnabled)
+        {
+            commandBuffer.EndDebugLabel();
+            commandBuffer.EndDebugLabel();
+        }
 
         commandBuffer.EndRenderPass();
         commandBuffer.End();
@@ -468,6 +634,12 @@ public sealed unsafe class VulkanRenderer : IDisposable
         _device.WaitIdle();
 
         _allocator.DestroyBuffer(_vertexBuffer, _vertexAllocation);
+
+        _fieldStepPipeline.Dispose();
+        _fieldStepShader.Dispose();
+        _fieldInput.Dispose();
+        _fieldOutput.Dispose();
+
         _device.DestroyVmaAllocator(_allocator);
 
         foreach (var fence in _frameFences)
@@ -485,6 +657,11 @@ public sealed unsafe class VulkanRenderer : IDisposable
         _device.DestroyRenderPass(RenderPass, null);
 
         _instance.DestroySurfaceKHR(_surface, null);
+
+        // The messenger must outlive every call that can trigger it, so it is destroyed after the device and
+        // surface but before the instance itself; destroying the instance first would leave a dangling handle.
+        if (!_debugMessenger.IsNull())
+            VulkanDebugMessenger.Uninstall(_instance, _debugMessenger);
 
         _device.Dispose();
         _instance.Dispose();
@@ -532,10 +709,10 @@ public sealed unsafe class VulkanRenderer : IDisposable
     private SwapchainState? CreateSwapchain(VkSwapchainKHR oldSwapchain, int2 requestedSize)
     {
         var capabilities = _physicalDevice.GetSurfaceCapabilitiesKHR(_surface);
-            var surfaceFormat =
-                _swapchain is null
-                    ? SelectSurfaceFormat(_physicalDevice, _surface)
-                    : new VkSurfaceFormatKHR { Format = _format, ColorSpace = VkColorSpaceKHR.SRGBNonlinearKHR };
+        var surfaceFormat =
+            _swapchain is null
+                ? SelectSurfaceFormat(_physicalDevice, _surface)
+                : new VkSurfaceFormatKHR { Format = _format, ColorSpace = VkColorSpaceKHR.SRGBNonlinearKHR };
 
         MinImageCount = Math.Max(capabilities.MinImageCount, 2);
         var imageCount = MinImageCount;
@@ -604,7 +781,7 @@ public sealed unsafe class VulkanRenderer : IDisposable
             ImageViews = imageViews,
             Framebuffers = [],
             Extent = extent,
-                    Format = surfaceFormat.Format,
+            Format = surfaceFormat.Format,
         };
     }
 
@@ -634,7 +811,7 @@ public sealed unsafe class VulkanRenderer : IDisposable
             ImageViews = state.ImageViews,
             Framebuffers = framebuffers,
             Extent = state.Extent,
-                    Format = state.Format,
+            Format = state.Format,
         };
     }
 
@@ -694,9 +871,9 @@ public sealed unsafe class VulkanRenderer : IDisposable
             return new VkSurfaceFormatKHR { Format = preferred[0], ColorSpace = VkColorSpaceKHR.SRGBNonlinearKHR };
 
         foreach (var format in preferred)
-        foreach (var available in formats)
-            if (available.Format == format && available.ColorSpace == VkColorSpaceKHR.SRGBNonlinearKHR)
-                return available;
+            foreach (var available in formats)
+                if (available.Format == format && available.ColorSpace == VkColorSpaceKHR.SRGBNonlinearKHR)
+                    return available;
 
         return formats[0];
     }
@@ -739,13 +916,13 @@ public sealed unsafe class VulkanRenderer : IDisposable
 
     private VkRenderPass CreateRenderPass(VkExtent2D extent)
     {
-            // A render pass has no size dependency, only a format one; the extent parameter documents
-            // that the initial swapchain created it, and rebuilds reuse it as-is.
+        // A render pass has no size dependency, only a format one; the extent parameter documents
+        // that the initial swapchain created it, and rebuilds reuse it as-is.
         _ = extent;
 
         var colorAttachment = new VkAttachmentDescription
         {
-                Format = _format,
+            Format = _format,
             Samples = VkSampleCountFlags._1Bit,
             LoadOp = VkAttachmentLoadOp.Clear,
             StoreOp = VkAttachmentStoreOp.Store,
@@ -808,6 +985,117 @@ public sealed unsafe class VulkanRenderer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Reads the demo compute pass's output back and compares it against the same step computed on the CPU.
+    /// </summary>
+    /// <remarks>
+    /// This is a self-test, not a feature: it runs once and logs the result. It exists because a compute
+    /// dispatch that does nothing is indistinguishable from one that works until something downstream reads
+    /// the buffer, and by then the cause is several layers away. Doing the comparison here means a broken
+    /// abstraction fails loudly at startup instead of producing a subtly wrong simulation later.
+    /// </remarks>
+    private void VerifyFieldStep()
+    {
+        var actual = new float[_fieldOutput.ElementCount];
+        _fieldOutput.Download(actual);
+
+        var expected = new float[_fieldInput.ElementCount];
+        _fieldInput.Download(expected);
+
+        // The same kernel as the shader, on the CPU.
+        var reference = new float[expected.Length];
+        var last = expected.Length - 1;
+        for (var i = 0; i < expected.Length; i++)
+        {
+            var left = i == 0 ? 0 : i - 1;
+            var right = i == last ? last : i + 1;
+            var mean = (expected[left] + expected[i] + expected[right]) / 3.0f;
+            reference[i] = expected[i] + (mean - expected[i]) * 0.5f;
+        }
+
+        var mismatches = 0;
+        var maxError = 0.0f;
+        for (var i = 0; i < reference.Length; i++)
+        {
+            var error = MathF.Abs(actual[i] - reference[i]);
+            maxError = MathF.Max(maxError, error);
+            // A float comparison, so an exact match is not expected; the tolerance is far below the
+            // difference a wrong kernel or a missing dispatch would produce.
+            if (error > 1e-5f)
+                mismatches++;
+        }
+
+        if (mismatches == 0)
+            _log.Info($"compute self-test passed: {reference.Length} element(s), max error {maxError:e2}");
+        else
+            _log.Error(
+                $"compute self-test FAILED: {mismatches} of {reference.Length} element(s) differ, "
+                    + $"max error {maxError:e2}"
+            );
+    }
+
+    /// <summary>
+    /// Records the demo compute pass: a diffusion step over a scalar field, then a barrier so the result is
+    /// visible to whatever reads it next.
+    /// </summary>
+    /// <remarks>
+    /// The barrier is the part that is easy to omit and hard to debug. Without it the dispatch and the
+    /// subsequent read are unordered, and the failure is a wrong value rather than an error, which is why
+    /// the abstraction makes the caller state the dependency explicitly instead of hiding it.
+    /// </remarks>
+    private void RecordFieldStep(CommandBuffer commandBuffer)
+    {
+        if (_tracingEnabled)
+            commandBuffer.BeginDebugLabel("Field step"u8, ComputeLabelColor);
+
+        var pushConstants = new FieldStepPushConstants
+        {
+            ElementCount = (uint)_fieldInput.ElementCount,
+            Step = 0.5f,
+        };
+
+        _fieldStepPipeline.PushConstants(commandBuffer, pushConstants);
+        _fieldStepPipeline.DispatchFor(
+            commandBuffer,
+            _fieldInput.ElementCount,
+            ComputeShaders.FieldStepLocalSize
+        );
+
+        // The shader writes a storage buffer; the next reader may be a transfer or a draw. Both are covered
+        // by naming the shader-write and shader-read stages rather than the narrower transfer stage.
+        Span<VkMemoryBarrier> barriers =
+        [
+            new VkMemoryBarrier
+            {
+                SrcAccessMask = VkAccessFlags.ShaderWriteBit,
+                DstAccessMask = VkAccessFlags.ShaderReadBit | VkAccessFlags.TransferReadBit,
+            },
+        ];
+
+        commandBuffer.PipelineBarrier(
+            VkPipelineStageFlags.ComputeShaderBit,
+            VkPipelineStageFlags.ComputeShaderBit | VkPipelineStageFlags.TransferBit,
+            VkDependencyFlags.None,
+            barriers,
+            [],
+            []
+        );
+
+        if (_tracingEnabled)
+            commandBuffer.EndDebugLabel();
+    }
+
+    /// <summary>
+    /// The starting contents of the demo field: a single spike in the middle, so a diffusion step has
+    /// something to visibly spread.
+    /// </summary>
+    private static float[] CreateInitialField()
+    {
+        var field = new float[FieldElementCount];
+        field[FieldElementCount / 2] = 1.0f;
+        return field;
+    }
+
     private static (VkBuffer Buffer, VmaAllocation Allocation) CreateTriangleVertexBuffer(VmaAllocator allocator)
     {
         ReadOnlySpan<Vertex> vertices =
@@ -866,36 +1154,36 @@ public sealed unsafe class VulkanRenderer : IDisposable
 
         // Viewport and scissor are dynamic: the extent changes whenever the swapchain is rebuilt.
         Span<VkDynamicState> dynamicStates = [VkDynamicState.Viewport, VkDynamicState.Scissor];
-                fixed (VkDynamicState* dynamicStatesPtr = dynamicStates)
+        fixed (VkDynamicState* dynamicStatesPtr = dynamicStates)
         {
-                    var dynamicState = new VkPipelineDynamicStateCreateInfo
-                    {
-                        DynamicStateCount = dynamicStates.Length,
-                        DynamicStates = dynamicStatesPtr,
-                    };
+            var dynamicState = new VkPipelineDynamicStateCreateInfo
+            {
+                DynamicStateCount = dynamicStates.Length,
+                DynamicStates = dynamicStatesPtr,
+            };
 
-                    // Counts must be set even with dynamic state, but the pointers are ignored.
-                    var viewportState = new VkPipelineViewportStateCreateInfo { ViewportCount = 1, ScissorCount = 1 };
+            // Counts must be set even with dynamic state, but the pointers are ignored.
+            var viewportState = new VkPipelineViewportStateCreateInfo { ViewportCount = 1, ScissorCount = 1 };
 
-                    return device.CreateGraphicsPipeline(
-                        VkPipelineCache.NullHandle,
-                        new VkGraphicsPipelineCreateInfo
-                        {
-                            StageCount = stages.Count,
-                            Stages = stages,
-                            VertexInputState = vertexInput,
-                            InputAssemblyState = Presets.InputAssembly.TriangleList,
-                            ViewportState = &viewportState,
-                            RasterizationState = Presets.Rasterization.Fill.CullNone,
-                            MultisampleState = Presets.Multisample.None,
-                            ColorBlendState = Presets.BlendState.BlendNone,
-                            DynamicState = &dynamicState,
-                            Layout = layout,
-                            RenderPass = renderPass,
-                            Subpass = 0,
-                        },
-                        null
-                    );
-                }
+            return device.CreateGraphicsPipeline(
+                VkPipelineCache.NullHandle,
+                new VkGraphicsPipelineCreateInfo
+                {
+                    StageCount = stages.Count,
+                    Stages = stages,
+                    VertexInputState = vertexInput,
+                    InputAssemblyState = Presets.InputAssembly.TriangleList,
+                    ViewportState = &viewportState,
+                    RasterizationState = Presets.Rasterization.Fill.CullNone,
+                    MultisampleState = Presets.Multisample.None,
+                    ColorBlendState = Presets.BlendState.BlendNone,
+                    DynamicState = &dynamicState,
+                    Layout = layout,
+                    RenderPass = renderPass,
+                    Subpass = 0,
+                },
+                null
+            );
+        }
     }
 }

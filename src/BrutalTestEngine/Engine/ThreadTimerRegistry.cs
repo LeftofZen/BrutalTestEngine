@@ -62,6 +62,24 @@ public sealed class ThreadTimerRegistry
 
         /// <summary>One database poll cycle.</summary>
         public const string DatabasePoll = "db.poll";
+
+        /// <summary>Advancing the physics world by one iteration's worth of time.</summary>
+        public const string PhysicsStep = "phys.step";
+
+        /// <summary>Draining and applying physics-targeted commands.</summary>
+        public const string PhysicsDrain = "phys.drain";
+
+        /// <summary>One mixer update.</summary>
+        public const string AudioUpdate = "audio.update";
+
+        /// <summary>Draining and applying audio-targeted commands.</summary>
+        public const string AudioDrain = "audio.drain";
+
+        /// <summary>Waiting for the next MCP request to arrive.</summary>
+        public const string McpPoll = "mcp.poll";
+
+        /// <summary>Handling one MCP request, from parse to reply.</summary>
+        public const string McpRequest = "mcp.request";
     }
 
     private readonly Dictionary<string, ThreadMetrics> _metrics = new(StringComparer.Ordinal);

@@ -37,6 +37,11 @@ public class CommandParserTests
                 CommandParser.Parse("reset-simulation", CommandSource.Remote),
                 Is.TypeOf<ResetSimulationCommand>()
             );
+            Assert.That(CommandParser.Parse("capture", CommandSource.Remote), Is.TypeOf<CaptureFrameCommand>());
+            Assert.That(
+                CommandParser.Parse("log-level debug", CommandSource.Remote),
+                Is.TypeOf<SetLogLevelCommand>()
+            );
         });
     }
 
@@ -260,9 +265,61 @@ public class CommandParserTests
         ];
 
         Assert.Multiple(() =>
-                {
-                    foreach (var verb in verbs)
-                        Assert.That(CommandParser.HelpText, Does.Contain(verb), $"help output is missing '{verb}'");
-                });
+        {
+            foreach (var verb in verbs)
+                Assert.That(CommandParser.HelpText, Does.Contain(verb), $"help output is missing '{verb}'");
+        });
+    }
+
+    [Test]
+    public void Every_documented_log_level_spelling_parses()
+    {
+        // A level that is silently rejected looks identical to a level that changed and had no
+        // effect, so every spelling a developer might type has to reach the same command.
+        Assert.Multiple(() =>
+        {
+            foreach (var spelling in new[] { "verbose", "trace", "debug", "info", "information", "warn", "warning", "error", "fatal", "critical" })
+            {
+                Assert.That(
+                    CommandParser.Parse($"log-level {spelling}", CommandSource.Remote),
+                    Is.TypeOf<SetLogLevelCommand>(),
+                    $"'{spelling}' should parse"
+                );
+            }
+
+            Assert.That(
+                CommandParser.Parse("log-level nonsense", CommandSource.Remote),
+                Is.TypeOf<UnhandledCommand>()
+            );
+        });
+    }
+
+    [Test]
+    public void The_new_verbs_round_trip_through_the_wire_format()
+    {
+        // A command that can be sent must be encodable, or a remote source could issue something
+        // it could never have expressed.
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                CommandParser.TryFormat(
+                    new CaptureFrameCommand { Source = CommandSource.Remote },
+                    out var capture
+                ),
+                Is.True
+            );
+            Assert.That(capture, Is.EqualTo("capture"));
+            Assert.That(CommandParser.Parse(capture, CommandSource.Remote), Is.TypeOf<CaptureFrameCommand>());
+
+            Assert.That(
+                CommandParser.TryFormat(
+                    new SetLogLevelCommand { Source = CommandSource.Remote, Level = "debug" },
+                    out var logLevel
+                ),
+                Is.True
+            );
+            Assert.That(logLevel, Is.EqualTo("log-level debug"));
+            Assert.That(CommandParser.Parse(logLevel, CommandSource.Remote), Is.TypeOf<SetLogLevelCommand>());
+        });
     }
 }

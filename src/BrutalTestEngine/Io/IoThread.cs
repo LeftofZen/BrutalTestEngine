@@ -36,17 +36,17 @@ public sealed class IoThread : IDisposable
     private readonly MpscQueue<IoJob> _jobs = new();
     private readonly Thread _thread;
     private readonly CancellationTokenSource _cancellation = new();
-        private readonly ThreadMetrics _jobMetrics;
+    private readonly ThreadMetrics _jobMetrics;
     private long _completed;
     private long _failed;
     private volatile bool _disposed;
 
-        /// <param name="timers">Where this thread records how long each job took.</param>
-        public IoThread(ThreadTimerRegistry timers)
+    /// <param name="timers">Where this thread records how long each job took.</param>
+    public IoThread(ThreadTimerRegistry timers)
     {
-            ArgumentNullException.ThrowIfNull(timers);
+        ArgumentNullException.ThrowIfNull(timers);
 
-            _jobMetrics = timers.Get(ThreadTimerRegistry.Keys.IoJob);
+        _jobMetrics = timers.Get(ThreadTimerRegistry.Keys.IoJob);
 
         _thread = new Thread(Run)
         {
@@ -94,7 +94,7 @@ public sealed class IoThread : IDisposable
             }
 
             Exception? error = null;
-                        var jobStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            var jobStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 job.Work();
@@ -106,12 +106,12 @@ public sealed class IoThread : IDisposable
                 Interlocked.Increment(ref _failed);
                 Faulted?.Invoke(job, exception);
             }
-                        finally
-                        {
-                            // Measured over the work only, not the completion callback: the callback is bookkeeping the
-                            // caller supplied, and folding it in would blame the IO thread for the caller's code.
-                            _jobMetrics.RecordSince(jobStartedAt);
-                        }
+            finally
+            {
+                // Measured over the work only, not the completion callback: the callback is bookkeeping the
+                // caller supplied, and folding it in would blame the IO thread for the caller's code.
+                _jobMetrics.RecordSince(jobStartedAt);
+            }
 
             try
             {

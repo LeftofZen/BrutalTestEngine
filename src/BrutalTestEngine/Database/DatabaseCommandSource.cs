@@ -41,7 +41,7 @@ public sealed class DatabaseCommandSource : IDisposable
     private readonly Thread _thread;
     private readonly CancellationTokenSource _cancellation = new();
     private readonly ManualResetEventSlim _pollCompleted = new(false);
-        private readonly ThreadMetrics _pollMetrics;
+    private readonly ThreadMetrics _pollMetrics;
     private long _lastId;
     private long _commandsPosted;
     private long _polls;
@@ -51,26 +51,26 @@ public sealed class DatabaseCommandSource : IDisposable
 
     /// <param name="bus">The command bus rows are posted to.</param>
     /// <param name="io">The IO thread that performs the blocking database work.</param>
-        /// <param name="timers">Where this source records how long one poll cycle took.</param>
+    /// <param name="timers">Where this source records how long one poll cycle took.</param>
     /// <param name="databasePath">Path to the SQLite database file.</param>
     /// <param name="table">Name of the table to watch.</param>
-        public DatabaseCommandSource(
-            CommandBus bus,
-            IoThread io,
-            ThreadTimerRegistry timers,
-            string databasePath,
-            string table = "commands"
-        )
+    public DatabaseCommandSource(
+        CommandBus bus,
+        IoThread io,
+        ThreadTimerRegistry timers,
+        string databasePath,
+        string table = "commands"
+    )
     {
         ArgumentNullException.ThrowIfNull(bus);
         ArgumentNullException.ThrowIfNull(io);
-            ArgumentNullException.ThrowIfNull(timers);
+        ArgumentNullException.ThrowIfNull(timers);
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(table);
 
         _bus = bus;
         _io = io;
-            _pollMetrics = timers.Get(ThreadTimerRegistry.Keys.DatabasePoll);
+        _pollMetrics = timers.Get(ThreadTimerRegistry.Keys.DatabasePoll);
         Table = table;
 
         // Read/write/create, so the engine's own verification can write rows and prove the path end to end.
@@ -153,17 +153,17 @@ public sealed class DatabaseCommandSource : IDisposable
 
         while (!token.IsCancellationRequested)
         {
-                    var pollStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-                    try
-                    {
-                        RunOnIo(Poll);
-                    }
-                    finally
-                    {
-                        // Measured across the hand-off to the IO thread and back, because that round trip — not just
-                        // the SQL — is what the polling thread actually pays for.
-                        _pollMetrics.RecordSince(pollStartedAt);
-                    }
+            var pollStartedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                RunOnIo(Poll);
+            }
+            finally
+            {
+                // Measured across the hand-off to the IO thread and back, because that round trip — not just
+                // the SQL — is what the polling thread actually pays for.
+                _pollMetrics.RecordSince(pollStartedAt);
+            }
 
             if (token.WaitHandle.WaitOne(PollIntervalMilliseconds))
                 break;

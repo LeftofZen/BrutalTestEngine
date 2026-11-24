@@ -3,7 +3,9 @@ using System.Text;
 using Brutal.Numerics;
 using BrutalTestEngine.Commands;
 using BrutalTestEngine.Engine;
+using BrutalTestEngine.Logging;
 using BrutalTestEngine.Threading;
+using MSLogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace BrutalTestEngine.Input;
 
@@ -50,9 +52,12 @@ public sealed class InputThread : IDisposable, ICommandHandler
 
     private readonly CommandBus _bus;
     private readonly TripleBuffer<InputSnapshot> _snapshots = new(() => InputSnapshot.Empty);
-        private readonly Lock _snapshotGate = new();
-        private readonly ThreadMetrics _drainMetrics;
-        private readonly ThreadMetrics _publishMetrics;
+    private readonly Lock _snapshotGate = new();
+    private readonly ThreadMetrics _drainMetrics;
+    private readonly ThreadMetrics _publishMetrics;
+
+    // Cached so the per-event log calls below cost a field read and a level check when they are filtered out.
+    private readonly Brutal.Logging.LogCategory _log = EngineLog.Categories.Input;
     private readonly Thread _thread;
     private readonly CancellationTokenSource _cancellation = new();
     private readonly HashSet<int> _keysDown = [];
@@ -66,17 +71,17 @@ public sealed class InputThread : IDisposable, ICommandHandler
     private volatile bool _disposed;
 
     /// <param name="bus">The command bus this thread consumes input commands from.</param>
-        /// <param name="timers">
-        /// Where this thread records how long draining commands and publishing a snapshot take.
-        /// </param>
-        public InputThread(CommandBus bus, ThreadTimerRegistry timers)
+    /// <param name="timers">
+    /// Where this thread records how long draining commands and publishing a snapshot take.
+    /// </param>
+    public InputThread(CommandBus bus, ThreadTimerRegistry timers)
     {
-            ArgumentNullException.ThrowIfNull(bus);
-            ArgumentNullException.ThrowIfNull(timers);
+        ArgumentNullException.ThrowIfNull(bus);
+        ArgumentNullException.ThrowIfNull(timers);
 
         _bus = bus;
-            _drainMetrics = timers.Get(ThreadTimerRegistry.Keys.InputDrain);
-            _publishMetrics = timers.Get(ThreadTimerRegistry.Keys.InputPublish);
+        _drainMetrics = timers.Get(ThreadTimerRegistry.Keys.InputDrain);
+        _publishMetrics = timers.Get(ThreadTimerRegistry.Keys.InputPublish);
 
         _thread = new Thread(Run)
         {
@@ -94,17 +99,17 @@ public sealed class InputThread : IDisposable, ICommandHandler
     /// Reads the newest input snapshot. The returned instance is owned by this thread and stays valid
     /// until the next call, so copy out what is needed.
     /// </summary>
-        /// <remarks>
-        /// The triple buffer behind this allows exactly one reader thread. Both the simulation thread and the
-        /// main thread sample input, so the handoff between them and the buffer is serialised here rather than
-        /// letting two threads claim the same published slot. The gate is only ever taken by a caller that
-        /// wants the newest value, so neither the input thread nor a reader is blocked on the other's work.
-        /// </remarks>
-        public bool TryReadSnapshot(out InputSnapshot snapshot, out long version)
-        {
-            lock (_snapshotGate)
-                return _snapshots.TryRead(out snapshot, out version);
-        }
+    /// <remarks>
+    /// The triple buffer behind this allows exactly one reader thread. Both the simulation thread and the
+    /// main thread sample input, so the handoff between them and the buffer is serialised here rather than
+    /// letting two threads claim the same published slot. The gate is only ever taken by a caller that
+    /// wants the newest value, so neither the input thread nor a reader is blocked on the other's work.
+    /// </remarks>
+    public bool TryReadSnapshot(out InputSnapshot snapshot, out long version)
+    {
+        lock (_snapshotGate)
+            return _snapshots.TryRead(out snapshot, out version);
+    }
 
     public void Dispose()
     {
@@ -125,16 +130,16 @@ public sealed class InputThread : IDisposable, ICommandHandler
 
         while (!token.IsCancellationRequested)
         {
-                    var drainStartedAt = Stopwatch.GetTimestamp();
+            var drainStartedAt = Stopwatch.GetTimestamp();
             _bus.Drain(CommandTarget.Input, this, MaxCommandsPerDrain);
-                    _drainMetrics.RecordSince(drainStartedAt);
+            _drainMetrics.RecordSince(drainStartedAt);
 
             var now = clock.Elapsed.TotalSeconds;
             if (_dirty && now >= nextPublishSeconds)
             {
-                        var publishStartedAt = Stopwatch.GetTimestamp();
+                var publishStartedAt = Stopwatch.GetTimestamp();
                 PublishSnapshot();
-                        _publishMetrics.RecordSince(publishStartedAt);
+                _publishMetrics.RecordSince(publishStartedAt);
                 nextPublishSeconds = now + PublishIntervalSeconds;
             }
 
@@ -152,6 +157,12 @@ public sealed class InputThread : IDisposable, ICommandHandler
         else
             _keysDown.Remove(command.Key);
 
+        // Input events are the highest-volume thing the engine logs, so they sit at the lowest level: they
+        // are only worth seeing when something is wrong with input, and at any higher level they would bury
+        // everything else. The level check is what keeps the interpolated string from being formatted.
+        if (_log.IsEnabled(MSLogLevel.Trace))
+            _log.Trace($"key {command.Key} {(command.Pressed ? "down" : "up")}");
+
         Count();
     }
 
@@ -162,24 +173,39 @@ public sealed class InputThread : IDisposable, ICommandHandler
         else
             _buttonsDown.Remove(command.Button);
 
+        if (_log.IsEnabled(MSLogLevel.Trace))
+            _log.Trace($"mouse {command.Button} {(command.Pressed ? "down" : "up")}");
+
         Count();
     }
 
     void ICommandHandler.Handle(CursorMoveCommand command)
     {
         _cursorPosition = new double2(command.X, command.Y);
+
+        if (_log.IsEnabled(MSLogLevel.Trace))
+            _log.Trace($"cursor {command.X:0.0},{command.Y:0.0}");
+
         Count();
     }
 
     void ICommandHandler.Handle(ScrollCommand command)
     {
         _scrollDelta += new double2(command.X, command.Y);
+
+        if (_log.IsEnabled(MSLogLevel.Trace))
+            _log.Trace($"scroll {command.X:0.00},{command.Y:0.00}");
+
         Count();
     }
 
     void ICommandHandler.Handle(TextInputCommand command)
     {
         _typedText.Append(command.Text);
+
+        if (_log.IsEnabled(MSLogLevel.Trace))
+            _log.Trace($"text '{command.Text}'");
+
         Count();
     }
 
@@ -192,6 +218,9 @@ public sealed class InputThread : IDisposable, ICommandHandler
             _keysDown.Clear();
             _buttonsDown.Clear();
         }
+
+        if (_log.IsEnabled(MSLogLevel.Trace))
+            _log.Trace($"focus {(_focused ? "gained" : "lost")}");
 
         Count();
     }
@@ -217,7 +246,17 @@ public sealed class InputThread : IDisposable, ICommandHandler
 
     void ICommandHandler.Handle(ResetSimulationCommand command) => Ignore();
 
+    void ICommandHandler.Handle(CaptureFrameCommand command) => Ignore();
+
+    void ICommandHandler.Handle(SetLogLevelCommand command) => Ignore();
+
     void ICommandHandler.Handle(UnhandledCommand command) => Ignore();
+
+    void ICommandHandler.Handle(AddBodyCommand command) => Ignore();
+
+    void ICommandHandler.Handle(SetGravityCommand command) => Ignore();
+
+    void ICommandHandler.Handle(SetVolumeCommand command) => Ignore();
 
     private static void Ignore()
     {

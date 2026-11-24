@@ -1,9 +1,10 @@
-# Brutal Test Engine
+﻿# Brutal Test Engine
 
 A minimal .NET 10 game engine built on the [BRUTAL](https://github.com/ahwootech/BRUTAL) framework.
 It opens a GLFW window, renders a triangle with Vulkan, and draws a Dear ImGui debug panel over it.
 The simulation runs on a fixed timestep on its own thread, with input, IO and networking each on a
-thread of their own.
+thread of their own. It is written data-oriented, and it exposes its live state to a machine over MCP
+as well as to a person through the debug panel.
 
 The solution has three projects: the engine library, a deliberately blank game that hosts it, and a
 unit-test project. The engine owns no entry point — see [Layout](#layout).
@@ -48,10 +49,18 @@ binding. Concretely:
   `Brutal.VulkanApi.Vma` — `Instance`, `DeviceEx`, `Queue`, `CommandBuffer`, `VmaAllocator` and
   friends. Don't add our own P/Invoke bindings or call `vk*` entry points directly.
 - **Windowing and input:** use `Brutal.GlfwApi`, not another GLFW wrapper.
-- **Strings and logging:** use `Brutal.Strings` (`Utf8`, `ImString`) and the logging pipeline, not
-  bespoke string helpers or `Console.WriteLine` for engine logs.
+- **Strings and logging:** use `Brutal.Strings` (`Utf8`, `ImString`) and `Brutal.Logging`
+  (`LogCategory`) for engine logs. Serilog is the sink pipeline underneath `LogSystem`, not a
+  replacement for it — see [Logging](#logging).
 - **Shader compilation:** use `Brutal.ShaderCApi`, not an external `glslc` invocation.
 - **ImGui:** use `Brutal.ImGuiApi` and `Brutal.ImGuiApi.Backends`, not raw bindings.
+- **GPU capture:** use `Brutal.RenderDocApi` (`RenderDoc`, and `RenderDocWindow` for the panel), not a
+  hand-written ABI table — see [GPU capture](#gpu-capture-trace-labels-renderdoc-and-tracy).
+- **Networking:** use `Brutal.RakNetApi` (`RakPeerInstance`, `RakPeerInterface`), not another transport
+  library — see [Networking](#networking).
+- **Physics:** use `Brutal.JoltApi` (`PhysicsSystem`, `BodyInterface`), not another physics library — see
+  [Physics](#physics).
+- **Audio:** use `Brutal.FmodApi` (`Fmod`, `FmodSystem`), not another audio library — see [Audio](#audio).
 
 What *is* ours is the architecture: the layering, the loop, ownership and lifetime policy, and the
 gameplay/world code. Even there, reach for framework primitives first and write new code only where
@@ -59,13 +68,24 @@ BRUTAL deliberately leaves a gap — which is the entire point of a framework.
 
 BRUTAL ships far more than the subset this project currently references, so before writing anything
 non-trivial, check the [BRUTAL repository](https://github.com/ahwootech/BRUTAL) for an existing
-library. For example: `Brutal.Jolt` and `Brutal.Box2D` for physics,
-`Brutal.Gltf`/`Brutal.Ktx`/`Brutal.MeshOptimizer` for assets and meshes, `Brutal.Concurrency` for
-jobs, `Brutal.Memory` for allocators, `Brutal.Fmod` for audio, `Brutal.Monitor.*` for diagnostics.
-Adding a package reference to an existing `Ahwoo.BRUTAL.*` library beats writing our own.
+library. For example: `Brutal.Box2D` for 2D physics, `Brutal.Gltf`/`Brutal.Ktx`/`Brutal.MeshOptimizer`
+for assets and meshes, `Brutal.Concurrency` for jobs, `Brutal.Memory` for allocators,
+`Brutal.Monitor.*` for diagnostics. Adding a package reference to an existing `Ahwoo.BRUTAL.*` library
+beats writing our own.
 
-Currently referenced: `Ahwoo.BRUTAL.Core`, `.Glfw`, `.ImGui`, `.ImGui.Backends`, `.Memory`,
-`.Numerics`, `.ShaderC`, `.Strings`, `.Vulkan`, `.Vulkan.Abstractions` and `.Vulkan.Vma` — see
+This is not theoretical — it caught a real duplication. RenderDoc support was originally hand-rolled
+here, complete with a copy of the `RENDERDOC_API_1_7_0` table, because `Ahwoo.BRUTAL.RenderDoc` had not
+been spotted. The fix was to delete the wrapper's ABI and keep only the timing decision that belongs to
+a host. When in doubt, list the packages before writing the code:
+
+```bash
+curl -s "https://azuresearch-usnc.nuget.org/query?q=Ahwoo.BRUTAL&take=100" \
+  | jq -r '.data[].id' | sort
+```
+
+Currently referenced: `Ahwoo.BRUTAL.Core`, `.Fmod`, `.Glfw`, `.ImGui`, `.ImGui.Backends`, `.Jolt`,
+`.Logging`, `.Memory`, `.Numerics`, `.RakNet`, `.RenderDoc`, `.RenderDoc.ImGui`, `.ShaderC`, `.Strings`,
+`.Vulkan`, `.Vulkan.Abstractions` and `.Vulkan.Vma` — see
 [BrutalTestEngine.csproj](src/BrutalTestEngine/BrutalTestEngine.csproj). They are referenced by the
 engine library only, so a game inherits them by referencing the engine once.
 
@@ -78,6 +98,9 @@ engine library only, so a game inherits them by referencing the engine once.
   and a borderless-fullscreen window.
 - Compiles two inline GLSL shaders at runtime with ShaderC and draws a coloured triangle from a
   VMA-allocated vertex buffer.
+- Runs compute passes through a small abstraction — a compiled shader, a typed buffer and a pipeline that
+  owns its descriptor set — and verifies the demo pass by reading its output back and comparing it against
+  the same kernel on the CPU — see [Compute shaders](#compute-shaders).
 - Runs Dear ImGui with the GLFW and Vulkan backends, recording its draw lists into the same render
   pass so the debug panel composites over the scene.
 - Shows frame time, FPS, framebuffer size and the Vulkan device name, with a toggle for the ImGui
@@ -88,6 +111,23 @@ engine library only, so a game inherits them by referencing the engine once.
   input, IO and networking each on a thread of their own.
 - Routes every intent — keyboard, mouse, network, console, remote console, web and database — through
   one threaded command queue, with an in-engine console panel that shows the live command stream.
+- Logs through BRUTAL's `LogCategory` primitive into a Serilog pipeline with a bounded asynchronous
+  sink, so a log call in a hot loop allocates nothing when disabled and never blocks the caller.
+- Shows that stream in an ImGui log window with level, category and text filters, where input events sit
+  at the lowest level so they never bury anything else — see [The log window](#the-log-window).
+- Emits Vulkan debug labels for GPU capture, routes validation messages into the log, and can trigger
+  a RenderDoc frame capture over any transport — all optional, and all no-ops when the tools are
+  absent.
+- Runs on an `INetworkTransport` seam over RakNet by default, so the networking library is a choice
+  rather than a commitment.
+- Runs physics on its own thread behind an `IPhysicsWorld` seam, with a Jolt backend written against
+  BRUTAL's binding.
+- Runs audio on its own thread behind an `IAudioSystem` seam, with an FMOD backend.
+- Stores simulation entities in a struct-of-arrays store and steps them with flat, allocation-free
+  array passes — see [Data-oriented design](#data-oriented-design).
+- Exposes every engine variable and the whole command grammar over MCP on its own thread, so a client
+  can inspect and drive a running engine as data rather than through screenshots — see
+  [MCP](#mcp-live-inspection-for-a-machine).
 
 Pressing <kbd>Escape</kbd> closes the window.
 
@@ -110,9 +150,17 @@ Options:
 | --- | --- |
 | `--frames=N` | Render `N` frames then exit instead of running until the window closes. |
 | `--tick-rate=HZ` | Simulation ticks per second (default `60`). Independent of the frame rate. |
-| `--validate` | Enable the Vulkan validation layer when it is installed. |
+| `--log=LEVEL` | Log level: `verbose`, `debug`, `information`, `warning`, `error` or `fatal`. |
+| `--log-file=PATH` | Also write rolling daily log files to `PATH` (7 files retained). |
+| `--validate` | Enable the Vulkan validation layer *and* debug tracing. |
+| `--trace` | Enable Vulkan debug labels for GPU capture, without validation layers. |
+| `--renderdoc` | Enable RenderDoc in-application capture when RenderDoc is attached. |
+| `--captures=DIR` | Where RenderDoc writes captures (default: RenderDoc's own setting). |
+| `--physics` | Enable the Jolt physics world. Off by default while BRUTAL's binding faults on step. |
+| `--no-audio` | Do not open an audio device. |
 | `--fullscreen` | Start in borderless fullscreen instead of a windowed window. |
 | `--web=PORT` | Listen for commands as HTTP requests on `127.0.0.1:PORT`. |
+| `--mcp=PORT` | Serve the MCP server on `127.0.0.1:PORT`, exposing every engine variable. |
 | `--database=PATH` | Poll a SQLite database at `PATH` for commands. |
 | `--selftest` | Drive every command source, verify the results, then exit. |
 | `--help` | Print usage. |
@@ -142,22 +190,43 @@ over one authoritative simulation, so the engine cannot be allowed to assume it 
 BrutalTestEngine.slnx
 src/BrutalTestEngine           the engine library (net10.0, OutputType=Library)
 ├── Engine
-│   ├── EngineOptions.cs       title, size, frame limit, tick rate, validation toggle, start mode
+│   ├── EngineOptions.cs       title, size, frame limit, tick rate, tracing, transport, capture
 │   ├── Engine.cs              lifecycle, thread ownership and the main-thread frame loop
 │   ├── Window.cs              GLFW lifetime, the window itself, windowed/fullscreen modes
 │   ├── WindowMode.cs          windowed or borderless fullscreen
-│   ├── VulkanRenderer.cs      instance, device, swapchain, render pass, triangle pipeline
+│   ├── VulkanRenderer.cs      instance, device, swapchain, render pass, triangle pipeline, debug labels
+│   ├── VulkanDebugMessenger.cs routes validation/debug-utils messages into the log
+│   ├── RenderDocCapture.cs    RenderDoc's in-application API, via BRUTAL's binding
 │   ├── SwapchainState.cs      everything rebuilt when the swapchain is recreated
 │   ├── RenderThread.cs        the render thread and the main↔render frame handshake
 │   ├── ImGuiVulkanRenderer.cs the ImGui Vulkan backend, owned by the render thread
 │   ├── DebugUi.cs             ImGui context, GLFW backend and the debug panel (main thread)
 │   ├── CommandSelfTest.cs     drives every command source end to end and reports the result
+│   ├── CvarRegistry.cs        the readable-variable registry the MCP server reads
+│   ├── EngineStatus.cs        the one-call status summary the MCP server serves
 │   ├── ThreadMetrics.cs       rolling per-thread latency statistics: last, mean, p99 and max
 │   ├── ThreadTimerRegistry.cs one named metric per piece of work, shared by every thread
 │   └── Vertex.cs              position + colour vertex
+├── Logging
+│   ├── EngineLog.cs           the Serilog pipeline behind BRUTAL's categories, and the named categories
+│   ├── EngineLogOptions.cs    sinks, minimum level and the bounded async buffer size
+│   ├── LogEventBuffer.cs      bounded ring buffer of recent events, for the debug window
+│   └── LogEventSink.cs        feeds that buffer from the pipeline's background writer
+├── Compute
+│   ├── ComputeShader.cs       GLSL compiled to SPIR-V once, wrapped in a shader module
+│   ├── ComputeBuffer.cs       a VMA allocation sized for T, with upload/download/mapped access
+│   └── ComputePipeline.cs     descriptor set layout, pool, set, pipeline layout and pipeline, together
 ├── Threading
 │   ├── MpscQueue.cs           multi-producer/single-consumer queue for inbound work
 │   └── TripleBuffer.cs        lock-free single-writer/single-reader state handoff
+├── Physics
+│   ├── IPhysicsWorld.cs       the seam: create a body, read it, step the world
+│   ├── JoltPhysicsWorld.cs    the Jolt backend, written against BRUTAL's binding
+│   └── NullPhysicsWorld.cs    a world that does nothing and says so
+├── Audio
+│   ├── IAudioSystem.cs        the seam: initialize, update, report what is playing
+│   ├── FmodAudioSystem.cs     the FMOD backend, and the missing-native-library path
+│   └── NullAudioSystem.cs     a system that mixes nothing and says so
 ├── Commands
 │   ├── Command.cs             the command abstraction, its sources and targets, and every command type
 │   ├── CommandBus.cs          the concurrent per-target queues, sequencing, timing and logging
@@ -167,6 +236,7 @@ src/BrutalTestEngine           the engine library (net10.0, OutputType=Library)
 │   └── KeyBindings.cs         maps a key to the intent it stands for, separately from its key state
 ├── Simulation
 │   ├── SimulationThread.cs    fixed-timestep tick loop
+│   ├── EntityStore.cs         struct-of-arrays entity storage: the data-oriented core
 │   └── SimulationSnapshot.cs  immutable view of the simulation for other threads
 ├── Input
 │   ├── InputThread.cs         folds commands into a per-frame input snapshot
@@ -176,17 +246,31 @@ src/BrutalTestEngine           the engine library (net10.0, OutputType=Library)
 ├── Host
 │   ├── ConsoleCommandSource.cs reads commands from stdin on its own thread
 │   ├── RconServer.cs          loopback TCP line server
-│   └── WebCommandSource.cs    loopback HTTP listener
+│   ├── WebCommandSource.cs    loopback HTTP listener
+│   ├── McpCommandSource.cs    turns an MCP tool call into commands on the bus
+│   └── McpServerThread.cs     the MCP server: its own thread, its tools and its resources
 ├── Database/DatabaseCommandSource.cs  watches a SQLite table through the IO thread
 ├── Io/IoThread.cs             background file/database work queue
-├── Networking/NetworkThread.cs loopback UDP socket on its own thread
-└── Shaders/TriangleShaders.cs inline GLSL compiled at runtime
+├── Networking
+│   ├── INetworkTransport.cs   the transport seam: open, send, poll, close. No library named.
+│   ├── UdpNetworkTransport.cs the built-in loopback UDP transport
+│   ├── NetworkTransports.cs   the named transports a host can choose between
+│   └── NetworkThread.cs       drives a transport on its own thread and decodes to commands
+└── Shaders
+    ├── TriangleShaders.cs     inline GLSL for the demo triangle, compiled at runtime
+    └── ComputeShaders.cs      inline GLSL for the compute passes, compiled at runtime
 
 src/BrutalTestEngine.Game      the game's executable: references the engine and owns Main
-└── Program.cs                 argument parsing, top-level error handling, exit codes
+└── Program.cs                 argument parsing, logging bootstrap, error handling, exit codes
 
 tests/BrutalTestEngine.Tests   NUnit tests over the engine's concurrency and command layer
 ├── Commands/…                 parser round-trips, bus routing and ordering, log bounds, bindings
+├── Compute/…                  dispatch group arithmetic and the shader/constant agreement
+├── Engine/…                   per-thread metrics, the timer registry and the variable registry
+├── Host/…                     the MCP command source's bridge to the bus
+├── Logging/…                  the zero-allocation disabled path, runtime level changes, the log ring buffer
+├── Networking/…               a fake transport proving the engine is not tied to UDP
+├── Simulation/…               the entity store's layout, swap-remove and allocation-free step
 └── Threading/…                queue and triple-buffer behaviour under contention
 ```
 
@@ -256,15 +340,22 @@ thread boundary — every handoff is either an immutable snapshot or a queue.
 ```mermaid
 flowchart LR
     OS["OS / GLFW events"] -->|commands| BUS["CommandBus<br/>one queue per target"]
-    NET["Network thread<br/>UDP socket"] -->|commands| BUS
+        NET["Network thread<br/>drives an INetworkTransport"] -->|commands| BUS
+    AIO["Audio thread<br/>drives an IAudioSystem"] -->|commands| BUS
+    PHY["Physics thread<br/>drives an IPhysicsWorld"] -->|commands| BUS
     BUS -->|"CommandTarget.Input"| IN["Input thread"]
     IN -->|"InputSnapshot<br/>(TripleBuffer)"| SIM["Simulation thread<br/>fixed timestep"]
     BUS -->|"CommandTarget.Simulation"| SIM
     IO["IO thread<br/>file / database"] -->|counters| SIM
     SIM -->|"SimulationSnapshot<br/>(TripleBuffer)"| MAIN["Main thread<br/>GLFW + ImGui context"]
     BUS -->|"CommandTarget.Engine"| MAIN
+    BUS -->|"CommandTarget.Audio"| AIO
+    BUS -->|"CommandTarget.Physics"| PHY
     MAIN -->|"ImDrawDataPtr<br/>(handshake)"| RT["Render thread<br/>Vulkan + ImGui backend"]
     RT -->|"frame consumed"| MAIN
+    MCP["MCP thread<br/>streamable HTTP"] -->|"commands"| BUS
+    MCP -.->|"reads"| CV["CvarRegistry<br/>live readers"]
+    MAIN -.->|"reads"| CV
 ```
 
 | Thread | Priority | Owns | Talks to the rest of the engine through |
@@ -274,9 +365,13 @@ flowchart LR
 | Render | Above normal | The Vulkan device, swapchain, pipelines and the ImGui Vulkan backend | The frame handshake with the main thread |
 | Input | Above normal | Folding commands into per-frame state | Drains `CommandTarget.Input` from the bus, `TripleBuffer<InputSnapshot>` out |
 | IO | Below normal | File, database and other blocking work | `MpscQueue<IoJob>` in, a completion counter out |
-| Network | Below normal | A UDP socket and its receive loop | Posts commands to the bus, `MpscQueue` for outbound datagrams, a receive counter out |
+| Network | Below normal | An `INetworkTransport` and its receive loop | Posts commands to the bus, `MpscQueue` for outbound datagrams, a receive counter out |
+| Physics | Below normal | An `IPhysicsWorld` and its step clock | Drains `CommandTarget.Physics`, reports body and step counts out |
+| Audio | Below normal | An `IAudioSystem` and the mixer | Drains `CommandTarget.Audio`, reports channel and update counts out |
 | Console | Below normal | Reading lines from stdin | Posts commands to the bus |
 | rcon accept | Below normal | Accepting remote console connections | Posts commands to the bus; one further thread per client |
+| Web | Below normal | Accepting HTTP command requests | Posts commands to the bus; one thread-pool worker per request |
+| MCP | Below normal | The MCP server, its tools and its resources | Posts commands to the bus, reads the `CvarRegistry`; one thread-pool worker per request |
 
 A command is the only thing that crosses a thread boundary in the inbound direction, and the only
 thing that decides where a command goes is the target on the command itself. Nothing is shared
@@ -295,6 +390,9 @@ through counters.
   render thread records that draw data, submits and presents, then signals. The main thread only
   builds the next frame after the render thread has finished with the previous one, so the two are
   never inside ImGui at the same time — while submit and present still overlap with the next build.
+- **Physics and audio each own a clock.** A physics step can outlast the tick that asked for it, and a
+  sound device runs at its own rate entirely, so neither runs inside the simulation loop. Each is a
+  thread with its own period draining its own command queue; the simulation never waits on either.
 - **The simulation must not be tied to the frame rate.** It runs a fixed timestep, accumulating real
   time and consuming it in whole steps. If the renderer stalls, the simulation catches up in bounded
   steps rather than spiralling: the accumulator is clamped to eight steps per iteration and the
@@ -307,12 +405,20 @@ through counters.
   ImGui button press all end up as the same kind of object applied by the same code path. The bus is
   what makes it safe to have this many threads without a locking policy for shared state: there is no
   shared state, only queues and snapshots.
+- **A debugging surface must not be able to stall the thing it debugs.** The MCP server is a network
+  peer that may be slow, may disconnect mid-request and may hold a connection open for hours, so it
+  gets its own thread and hands each request to the thread pool. It reads engine state only through
+  the `CvarRegistry`, whose readers are lambdas over each owner's thread-safe accessors, so it never
+  touches the window, ImGui or the renderer's mutable state.
 
 ### The handoff primitives
 
 - `MpscQueue<T>` — many producers, one consumer, over `ConcurrentQueue<T>` plus a `SemaphoreSlim` so
-  the consumer can block with a timeout instead of spinning. Used for inbound work (IO jobs, outbound
-  datagrams) and as the per-target storage inside `CommandBus`.
+  the consumer can block with a timeout instead of spinning. The semaphore counts items enqueued and
+  not yet taken, so every successful dequeue consumes one signal; that accounting is what lets a
+  consumer mix `TryDequeue` and `WaitDequeue` on the same instance without leaving a surplus that
+  would make a later wait return immediately. Used for inbound work (IO jobs, outbound datagrams) and
+  as the per-target storage inside `CommandBus`.
 - `TripleBuffer<T>` — single writer, single reader, lock-free. The writer fills a slot it owns and
   hands it to the reader through one atomic compare-exchange, so the reader always takes the newest
   published instance and never blocks either side. Used for state that is overwritten rather than
@@ -344,6 +450,7 @@ The panel reports the two rates side by side, which is the quickest way to see t
 - The **Thread timings** table is the latency view — see [Timing every thread](#timing-every-thread).
 - The **Command console** panel reports accepted and pending commands, the per-target applied counts,
   the drain cost and the per-source counters.
+- The **Log window** (View → Log) is the filtered log stream — see [The log window](#the-log-window).
 
 On a 144 Hz display the panel typically shows FPS around 144 while the simulation holds 60.0 ticks/s
 with zero dropped ticks.
@@ -376,7 +483,7 @@ the statistics are in [ThreadMetrics.cs](src/BrutalTestEngine/Engine/ThreadMetri
 | `main.wait` | Main | Blocked on the render thread. Usually the largest item, and the one worth separating. |
 | `render.frame` | Render | `RenderFrame`: recording, submitting and presenting. |
 | `sim.tick` | Simulation | One `Tick()`. This is the number that must stay well under the timestep. |
-| `sim.cycle` | Simulation | One pass of the loop excluding the deliberate sleep, so idle time is not disguised as work. |
+| `sim.cycle` | Simulation | One pass of the loop that did work — a tick or an applied command — excluding the deliberate sleep. A pass that only waited is not recorded. |
 | `sim.drain` | Simulation | Applying `CommandTarget.Simulation` commands. |
 | `input.drain` | Input | Applying `CommandTarget.Input` commands. |
 | `input.publish` | Input | Writing the input snapshot, including the 4 ms rate limit. |
@@ -409,6 +516,578 @@ Even on a trivial scene that output is informative: `main.wait` is almost the wh
 so the main thread is not the bottleneck — it is idle waiting for the render thread, which is turn
 waiting on the display. A metric that never fired prints `no samples` rather than `0.000`, because a
 thread that was never asked to do anything is a different fact from one that did nothing quickly.
+
+## Logging
+
+Logging has two halves, and both are needed.
+
+**BRUTAL's `LogCategory` is the call site.** It is the framework's own primitive, so the engine's logs and
+the framework's Vulkan messages are one stream rather than two. The important property is that a log call
+is written as an interpolated string handler:
+
+```csharp
+private readonly LogCategory _log = EngineLog.Categories.Simulation;
+
+if (_log.IsEnabled(LogLevel.Debug))
+    _log.Debug($"tick {tick} took {milliseconds:0.000} ms");
+```
+
+When the category is disabled, **the interpolation is never evaluated**. No string is built, nothing is
+boxed, and the arguments are not even read. Measured over 100,000 calls with the category disabled:
+**0 bytes allocated**, ~0.1 µs per call. That is what "zero-copy on the caller thread" means concretely,
+and there is a test that fails if it ever stops being true
+([EngineLogTests.cs](tests/BrutalTestEngine.Tests/Logging/EngineLogTests.cs)).
+
+**Serilog is the pipeline.** It supplies the sinks, the structured events and — the part that matters for
+a game engine — an asynchronous sink. An enabled log call hands a pre-rendered event to a bounded queue and
+returns; it never waits on a console, a disk or a socket. A thread in a tick loop or a frame loop therefore
+cannot be stalled by logging.
+
+The queue is deliberately bounded and configured **not** to block when full. A saturated log drops events
+instead of stalling the engine: a stalled simulation is a bug, a missing debug line is not. Dropped events
+are counted and surfaced (`EngineLog.DroppedCount`, and the Diagnostics panel), because a silently lossy
+log is a trap — if someone is reading the log they need to know it has holes.
+
+Categories are named per concern (`engine`, `engine.main`, `engine.sim`, `engine.render`, `engine.vulkan`,
+`engine.input`, `engine.net`, `engine.io`, `engine.commands`, `engine.capture`) and created eagerly, so a
+thread caches its reference in a field and pays no lookup.
+
+The level is changeable at runtime from anywhere, including over the wire, because it is a command:
+
+```
+log-level debug
+```
+
+```sh
+curl "http://127.0.0.1:41800/?cmd=log-level%20debug"
+```
+
+One lifetime detail is load-bearing: the Serilog `Logger` is held and disposed explicitly. Disposing it is
+what drains the asynchronous buffer. `Log.CloseAndFlush()` does **not** reach a logger constructed here, and
+relying on it silently loses every buffered event at shutdown — usually the ones that explain the exit.
+
+```sh
+dotnet run --project src/BrutalTestEngine.Game -- --frames=60 --log=debug --log-file=logs/bte.log
+```
+
+### The log window
+
+A console sink writes to a terminal the engine cannot read back, so the debug window keeps its own copy of
+the stream: a bounded ring buffer of the most recent events
+([LogEventBuffer.cs](src/BrutalTestEngine/Logging/LogEventBuffer.cs)), fed by a Serilog sink that is itself
+wrapped in an asynchronous sink. The thread that logs therefore never touches the buffer — it hands a
+pre-rendered event to the pipeline's queue and returns, exactly as it does for the console and file sinks.
+The zero-allocation property above is unaffected.
+
+The window is opened from **View → Log** or the **Log window** checkbox in the Debug panel. It shows a
+relative timestamp, the level, the category and the message, and filters on:
+
+- **level**, as independent checkboxes rather than a single minimum. The useful views are not always
+  contiguous — "errors and warnings only" is a common one, and a minimum level cannot express it.
+- **category** and **message**, as case-insensitive substrings.
+- **auto-scroll**, and a **Clear** button.
+
+Verbose is **off by default**, and that is the point of the window. Input events are logged at the lowest
+level (`Trace`, which Serilog calls `Verbose`), because they are the highest-volume thing the engine
+produces: a mouse drag alone emits a cursor event per frame. At any higher level they would bury everything
+else, so they are only visible when someone deliberately asks for them. The command console's log is the
+other half of this — it shows every *intent* the engine accepted, which is the right thing for debugging the
+command system and the wrong thing for reading a log.
+
+Two counters make the buffer's limits visible rather than silent: `log.retained` and `log.overwritten`, both
+readable over MCP. A window that has quietly dropped half its history should say so.
+
+## GPU capture: trace labels, RenderDoc and Tracy
+
+Two tools, one prerequisite.
+
+**`--trace` turns on `VK_EXT_debug_utils`.** The instance extension is enabled at creation, a debug messenger
+routes validation and performance messages into the `engine.vulkan` category, and the render pass emits named
+debug-label regions:
+
+```
+Main pass
+├── Triangle
+└── ImGui
+```
+
+That is the whole value: a capture without labels is a flat list of draws with no idea which pass produced
+them. RenderDoc and Tracy both group work by these labels, so the same labels make both tools readable. The
+extension cannot be added after instance creation, which is why tracing is decided once, at startup.
+
+The messenger subscribes to warnings and errors only. `BuildDefaultDebugMessengerCreateInfo` asks for every
+severity including verbose, which turns a validation run into thousands of lines of loader chatter and hides
+the messages a developer actually acts on.
+
+**RenderDoc support is BRUTAL's, not hand-rolled.** The framework ships
+[Ahwoo.BRUTAL.RenderDoc](https://www.nuget.org/packages/Ahwoo.BRUTAL.RenderDoc) — a complete binding for the
+in-application API, including version negotiation and the `RENDERDOC_API_1_7_0` table — plus
+[Ahwoo.BRUTAL.RenderDoc.ImGui](https://www.nuget.org/packages/Ahwoo.BRUTAL.RenderDoc.ImGui), which is the
+capture panel itself. [RenderDocCapture.cs](src/BrutalTestEngine/Engine/RenderDocCapture.cs) is a thin wrapper
+over it that adds the one thing a host has to decide: when to load.
+
+That timing is the part that matters. RenderDoc hooks the Vulkan loader, so `RenderDoc.LoadApi` has to run
+**before the instance exists** — load it later and RenderDoc attaches but produces captures with no device
+creation in them. BRUTAL's own documentation is explicit about this, and it is why the call sits at the top of
+`VulkanRenderer.Create` rather than in the constructor.
+
+`RenderDoc.LoadApi` also installs hooks that cost performance and interfere with the validation layers, so it
+stays opt-in behind `--renderdoc`. When RenderDoc is absent — the normal case for a shipped build — it returns
+false and every call is a null check and nothing happens.
+
+The capture panel is a menu item under **View → RenderDoc**, shown only when RenderDoc is actually attached: a
+menu item that opens an empty window is worse than no menu item.
+
+Captures are triggered by a command rather than a key binding, so they work identically from the console,
+rcon, a web request or a test:
+
+```
+capture
+```
+
+```sh
+curl "http://127.0.0.1:41800/?cmd=capture"
+```
+
+The request is a flag applied on the render thread, not a direct call from whichever thread asked: only the
+thread that records a frame knows where its boundaries are, and calling RenderDoc from the main thread would
+race it and could open a capture mid-frame — the usual reason a replay looks broken.
+
+The engine deliberately does **not** call `StartFrameCapture`/`EndFrameCapture` on every frame. Doing that was
+the first implementation, and one 120-frame smoke run wrote 120 `.rdc` files — 270 of them had piled up in
+`%TEMP%\RenderDoc` by the time it was caught. `TriggerCapture` is the right primitive instead: RenderDoc picks
+its own complete frame, so a capture costs one file per command rather than one per frame. `BeginFrame`/`EndFrame` still exist on
+[RenderDocCapture.cs](src/BrutalTestEngine/Engine/RenderDocCapture.cs) for the case that needs a capture of one
+specific frame it is about to draw, which is a regression harness rather than a launch flag.
+
+To capture with RenderDoc, launch the engine *through* RenderDoc and turn the hook on:
+
+```sh
+renderdoccmd capture --working-dir . dotnet run --project src/BrutalTestEngine.Game -- --renderdoc --trace
+```
+
+Tracy needs no engine code: it hooks Vulkan at the driver level. Run the Vulkan-enabled Tracy capture on the
+engine and the debug labels above become the zone names:
+
+```sh
+tracy-vulkan-capture dotnet run --project src/BrutalTestEngine.Game -- --trace
+```
+
+With RenderDoc absent the engine logs the fact once at debug level and carries on, so `--renderdoc` is safe
+to leave in a launch profile.
+
+## Compute shaders
+
+The engine will lean on compute heavily — weather simulation, NPC simulation, crowd density, influence
+maps — so the abstraction exists to make those passes a shader swap rather than new plumbing. It lives in
+[src/BrutalTestEngine/Compute/](src/BrutalTestEngine/Compute/).
+
+Three types, each owning one thing:
+
+| Type | Owns |
+| --- | --- |
+| [ComputeShader](src/BrutalTestEngine/Compute/ComputeShader.cs) | GLSL source, compiled to SPIR-V once at startup, wrapped in a shader module |
+| [ComputeBuffer&lt;T&gt;](src/BrutalTestEngine/Compute/ComputeBuffer.cs) | A VMA allocation sized for `T`, with `Upload` / `Download` / `Mapped` |
+| [ComputePipeline](src/BrutalTestEngine/Compute/ComputePipeline.cs) | The descriptor set layout, pool, set, pipeline layout and pipeline, built together |
+
+Vulkan requires those four objects to be created in a specific order and kept alive together, which is
+where the boilerplate lives. Building them as one type means a call site is this:
+
+```csharp
+var shader = new ComputeShader(device, ComputeShaders.FieldStep, "field-step");
+var input = new ComputeBuffer<float>(allocator, 4096, "field-input");
+var output = new ComputeBuffer<float>(allocator, 4096, "field-output");
+
+var pipeline = new ComputePipeline(
+    device,
+    allocator,
+    shader,
+    [
+        new ComputeBinding(0, input.Buffer, input.Size),
+        new ComputeBinding(1, output.Buffer, output.Size),
+    ],
+    ComputeShaders.FieldStepPushConstantSize
+);
+
+input.Upload(field);
+
+// On the render thread, inside the frame's command buffer:
+pipeline.PushConstants(commandBuffer, pushConstants);
+pipeline.DispatchFor(commandBuffer, input.ElementCount, ComputeShaders.FieldStepLocalSize);
+```
+
+Three decisions are worth stating, because each one is a bug that would otherwise be silent:
+
+**The descriptor set layout is derived from the bindings.** The shader and the layout cannot drift apart,
+because there is only one list. The pool sizes are aggregated per descriptor type rather than per binding —
+two storage-buffer bindings need one pool size with a count of two, and passing two entries of one each
+makes the second allocation fail at startup with `DescriptorPoolOutOfMemoryException`.
+
+**`DispatchFor` does the group arithmetic.** A dispatch covers whole workgroups, so the last group almost
+always has more invocations than there are elements. Too few groups leaves the tail of the data
+unprocessed and produces no error at all; the shader's own bounds check handles the other direction. The
+rounding-up lives in one place so the dispatch and the buffer sizing cannot disagree.
+
+**The barrier is explicit.** A dispatch and a subsequent read are unordered without one, and the failure is
+a wrong value rather than an error. `RecordFieldStep` in
+[VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs) shows the pattern: dispatch, then a
+`PipelineBarrier` naming the shader-write and shader-read stages.
+
+Compute is recorded **before** the render pass opens, because a render pass is a graphics-only construct and
+a dispatch cannot be recorded inside one. It is recorded on the render thread, like all GPU work.
+
+### It is verified, not just compiled
+
+A dispatch that silently does nothing — a bad descriptor, a zero group count, a shader that returns early —
+is indistinguishable from one that works until something downstream reads the buffer, and by then the cause
+is several layers away. So the demo pass reads its own output back and compares it against the same kernel
+computed on the CPU, once, on the frame after it was submitted:
+
+```
+[10:53:35 INF] compute self-test passed: 4096 element(s), max error 0.00e+000
+```
+
+The field is 4096 elements at 64 invocations per workgroup, so the dispatch spans 64 workgroups — the case
+the group arithmetic has to get right. The managed-side arithmetic is unit-tested in
+[ComputePipelineTests.cs](tests/BrutalTestEngine.Tests/Compute/ComputePipelineTests.cs), including a test
+that fails if the C# local-size constant drifts from the shader's `local_size_x`.
+
+## Networking
+
+The engine does not know which networking library it uses, and that is deliberate. The default is
+**RakNet**, because that is the transport BRUTAL ships, but nothing above the seam names it.
+
+The seam is [INetworkTransport.cs](src/BrutalTestEngine/Networking/INetworkTransport.cs). A transport is
+narrow by design — it opens, it closes, it sends bytes to an endpoint, and it hands received bytes back. It
+knows nothing about sessions, reliability, channels, ordering or commands:
+
+```csharp
+public interface INetworkTransport : IDisposable
+{
+    string Name { get; }
+    IPEndPoint LocalEndPoint { get; }
+    bool IsOpen { get; }
+    int MaxPayloadSize { get; }
+    long ReceivedCount { get; }
+    long SentCount { get; }
+    long RejectedCount { get; }
+
+    void Open(int port);
+    bool Send(ReadOnlySpan<byte> payload);
+    bool SendTo(ReadOnlySpan<byte> payload, IPEndPoint endpoint);
+    bool Poll(int timeoutMilliseconds, out TransportDatagram datagram);
+}
+```
+
+Everything above that line is policy and stays in the engine: size limits, strict UTF-8 validation, command
+batching and the refusal to act on a malformed frame must behave identically whatever carries the bytes. A
+transport that guessed at payload meaning would make two transports behave differently on the same input.
+
+Choosing a transport is one property on `EngineOptions`:
+
+```csharp
+var engine = Engine.Create(new EngineOptions
+{
+    TransportFactory = NetworkTransports.RakNetClient("127.0.0.1:7777"),  // or NetworkTransports.Udp
+    NetworkPort = 0,
+});
+```
+
+A `Func<INetworkTransport>` factory rather than an enum, because a transport is configured at construction —
+server address, reliability settings, channel layout, certificates — and an enum would force all of that into
+option properties only one transport understands.
+
+Two transports ship:
+
+- **`RakNetTransport`** — the default, on [Ahwoo.BRUTAL.RakNet](https://www.nuget.org/packages/Ahwoo.BRUTAL.RakNet).
+  It is a peer rather than a bare socket: it accepts inbound connections and, when given a `host:port`, dials
+  out as a client as well, so the same class is the server, the client and the self-contained loopback peer.
+  RakNet multiplexes its own protocol messages through the same receive queue, so payloads are framed with the
+  message id RakNet reserves for application packets and a sequence number — without that, a connection
+  notification looks exactly like a command whose first four bytes happen to be a sequence.
+- **`UdpNetworkTransport`** — a bare loopback socket with no reliability and no connection concept. Kept as the
+  reference implementation of the contract, and as proof that the engine depends on the seam rather than on
+  RakNet.
+
+Payloads are sent **unreliable-sequenced** on purpose. The command stream is state-oriented: a stale command is
+worse than a lost one, and a transport that hid loss would hide it from the simulation that has to cope.
+
+The abstraction is proven rather than merely described. The tests drive the network thread through an
+entirely in-memory transport
+([NetworkTransportTests.cs](tests/BrutalTestEngine.Tests/Networking/NetworkTransportTests.cs)): if the engine
+can be driven through that, it can be driven through anything, and swapping the transport is a one-line change
+with no engine edits.
+
+**Threading.** A transport is owned by exactly one thread — the one that calls `Poll`. That is what lets an
+implementation keep its socket state unsynchronised and its receive path allocation-free. Only `Send`,
+`SendTo` and the counters are safe from any thread.
+
+## Physics
+
+Physics runs on its own thread and behind [IPhysicsWorld.cs](src/BrutalTestEngine/Physics/IPhysicsWorld.cs),
+for two reasons. The first is cost: a large world's step can outlast the tick that asked for it, and folding it
+into the simulation would make every other system's budget depend on the busiest moment in the physics world.
+The second is where this engine is going — a seamless world that splits itself by region will step several
+regions independently, and independent work needs independent threads.
+
+The thread is a clock rather than a slave to the tick rate. It advances the world by elapsed wall time, capped
+at 1/30 s per iteration, so a stalled frame cannot ask the solver to catch up by simulating a second in one
+step.
+
+The intended backend is **Jolt**, via
+[Ahwoo.BRUTAL.Jolt](https://www.nuget.org/packages/Ahwoo.BRUTAL.Jolt), and
+[JoltPhysicsWorld.cs](src/BrutalTestEngine/Physics/JoltPhysicsWorld.cs) is written against the real binding:
+two object layers so the broad phase skips static-static pairs, table-based broad-phase filters, a Jolt temp
+allocator. It is **not the default yet**, and the reason is a defect outside this engine:
+
+> BRUTAL's `PhysicsSystem.Update` raises an access violation as soon as the world contains a body. Creation,
+> `Init` and body creation all succeed; only the step faults, in every configuration tried — with and without a
+> job system, with table and with mask filters, with mutexes at zero and non-zero, on package versions
+> 2026.10.4 and 2026.10.2.
+
+An access violation terminates the process, so a managed `try`/`catch` cannot contain it. Defaulting to Jolt
+would therefore crash the engine the moment anything added a body, which is why `--physics` is opt-in.
+Everything above the seam is already written for it, so flipping the default is a one-line change once a
+working binding ships.
+
+```bash
+dotnet run --project src/BrutalTestEngine.Game -- --frames=600 --physics
+add-body static r5 0 0 0     # immovable geometry
+add-body r1 0 20 0           # a dynamic body above it
+gravity 0 -9.81 0
+```
+
+Choosing a backend is one property:
+
+```csharp
+var engine = Engine.Create(new EngineOptions
+{
+    PhysicsFactory = PhysicsWorlds.Jolt,   // or PhysicsWorlds.None, the default
+});
+```
+
+The contract is pinned by
+[PhysicsWorldContractTests.cs](tests/BrutalTestEngine.Tests/Physics/PhysicsWorldContractTests.cs) against an
+in-memory world. Those tests could not run at all if the engine depended on Jolt directly, and they are the
+ones that will still compile when the backend changes.
+
+## Audio
+
+Audio has its own thread and its own clock. A game tick must never block on a sound device, and a sound device
+must never be starved because a tick took too long; the mixer is updated at a fixed 10 ms period and receives
+`volume` commands like every other consumer rather than reading simulation state.
+
+The intended backend is **FMOD**, via [Ahwoo.BRUTAL.Fmod](https://www.nuget.org/packages/Ahwoo.BRUTAL.Fmod),
+and [FmodAudioSystem.cs](src/BrutalTestEngine/Audio/FmodAudioSystem.cs) initializes it with the 3D right-handed
+convention to match the engine's coordinate system.
+
+One caveat worth knowing before you look for the bug: **BRUTAL's package contains the managed binding only**.
+`fmod.dll` is licensed separately by Firelight and is not redistributable, so a fresh checkout has no native
+library and audio reports itself unavailable. The engine probes for it explicitly and says so once, rather than
+letting a `DllNotFoundException` surface from somewhere less obvious later:
+
+```
+INF audio unavailable: fmod.dll is not installed; set FMOD_DLL to a copy or drop it beside the executable
+```
+
+Point `FMOD_DLL` at a copy of the FMOD Studio runtime, or drop it beside the executable, and the device opens.
+
+Choosing a backend is one property:
+
+```csharp
+var engine = Engine.Create(new EngineOptions
+{
+    AudioFactory = AudioSystems.Fmod,   // or AudioSystems.None
+});
+```
+
+Both services are visible in the debug panel's Diagnostics section, and show *unavailable* with the backend
+name rather than hiding the row: a native library that is missing leaves a backend that looks present and does
+nothing, which is only visible if it is stated.
+
+## Data-oriented design
+
+The engine is written data-oriented, and this is a first principle rather than an optimisation pass. The
+target is a seamless world with thousands of players and NPCs in one place, so the cost that matters is
+not "how fast is one entity" but "how many entities fit through the cache per tick". That question has a
+layout answer, not an algorithm answer.
+
+### The principles
+
+1. **Data is laid out for the passes that read it, not for the objects that own it.** A pass that
+   integrates positions should walk positions and nothing else. An array-of-structs entity drags every
+   other field through the cache on every pass; a struct-of-arrays layout does not.
+2. **Iterate contiguous memory.** Every hot loop is a counted `for` over a `Span<T>` over a flat array.
+   No linked lists, no dictionaries, no pointer chasing, no `foreach` over an interface.
+3. **No per-entity heap objects.** An entity is an index into arrays, not a reference. Nothing in a tick
+   allocates, and nothing in a tick can trigger a collection.
+4. **No virtual dispatch in a hot loop.** Interfaces are used at seams — a physics backend, a network
+   transport, a command handler — where the call happens once per frame or per tick. They are not used
+   per entity.
+5. **Dense storage, swap-remove.** Live entities occupy a packed prefix of the arrays, so iteration is a
+   range rather than a scan for holes. Removal swaps the last entity into the gap.
+6. **Batch by stage, not by entity.** A tick runs spawn, then integrate, then resolve, then expire — each
+   as its own pass over its own arrays. One pass per array beats one pass per entity.
+7. **Determinism is a layout property too.** Spawning is a function of the tick number, so the same
+   command stream produces the same world on every node. That is what makes a sharded world replayable.
+8. **Measure the claim.** The allocation-free property is asserted by a test that measures
+   `GC.GetAllocatedBytesForCurrentThread` across 100 steps of a 4096-entity store, not by a comment.
+
+### Where it applies
+
+| Area | Layout | Why |
+| --- | --- | --- |
+| Simulation entities | [EntityStore.cs](src/BrutalTestEngine/Simulation/EntityStore.cs) — one array per component | The tick's hot path. This is the store the principles above are written for. |
+| Commands | One queue per target, drained in a bounded batch | A command is a small immutable record; the cost is the queue, not the object. |
+| Thread handoff | [TripleBuffer.cs](src/BrutalTestEngine/Threading/TripleBuffer.cs) — wait-free, no allocation | A snapshot is published by overwriting a reused instance, so a tick allocates nothing to publish. |
+| Thread metrics | [ThreadMetrics.cs](src/BrutalTestEngine/Engine/ThreadMetrics.cs) — a fixed 256-sample ring | Recording a duration is a few arithmetic ops and one array write, cheap enough to sit in a tick. |
+| Network payloads | A framed byte buffer, decoded in place | A datagram is parsed into commands without an intermediate object graph. |
+| Render submission | One vertex buffer, one push-constant block per frame | The draw is a single `Draw(3, …)`; there is no per-object state to chase. |
+
+### What is deliberately *not* an ECS
+
+There is no entity-component-system framework here, and that is a decision rather than an omission. A
+general ECS buys you runtime composition of arbitrary component sets; it costs you a type-erased
+component store, archetype bookkeeping and a query engine — all of which are indirection in the exact
+loop the layout exists to make fast. The engine's entity set is small, fixed and known at compile time,
+so the same cache behaviour is available from plain arrays with none of the machinery.
+
+The seam is deliberate: [EntityStore.cs](src/BrutalTestEngine/Simulation/EntityStore.cs) is the only
+place that knows the layout, and it exposes `Span<T>` over the live prefix rather than the backing
+arrays. If the world later needs runtime-composed components, that file is what changes — the tick, the
+snapshot and the renderer all read through it and none of them would need to know.
+
+### The store, concretely
+
+```csharp
+// One array per component. Adding an entity appends to each; the index is the entity.
+var store = new EntityStore(capacity: 4096);
+store.Add(x: 0, y: 6, z: 0, velocityY: 0, radius: 0.25f);
+
+// A tick is four flat passes, in the order a world would use them.
+store.Integrate(deltaSeconds, gravityY: -9.81f);   // position += velocity; velocity += gravity
+store.ResolveFloor(floorY: 0.0f);                  // clamp and reflect, only for entities below the floor
+store.RemoveExpired(maxAgeSeconds: 30.0f);         // swap-remove, iterating backwards
+```
+
+`RemoveExpired` iterates **backwards** on purpose: a swap-remove moves the last entity into the removed
+slot, so iterating forwards would move an unvisited entity into a slot already passed and silently skip
+it. That is the kind of bug a layout like this invites, which is why it has its own test.
+
+## MCP: live inspection for a machine
+
+Debugging a running engine through screenshots is lossy. A screenshot cannot be diffed, cannot be
+asserted on, and cannot be taken at all when the window is minimised or the machine is headless. The
+engine therefore serves the **Model Context Protocol** on its own thread, exposing its live state as
+data and its command grammar as a tool.
+
+```sh
+dotnet run --project src/BrutalTestEngine.Game -- --mcp=41900
+```
+
+```
+MCP: http://127.0.0.1:41900/ exposing 111 variable(s) and the command grammar
+```
+
+### What it exposes
+
+| Kind | Name | What it does |
+| --- | --- | --- |
+| Tool | `list_cvars` | Every readable variable, with its value, type and meaning. |
+| Tool | `get_cvar` | One variable by name, for example `engine.frames` or `net.poll.mean`. |
+| Tool | `run_command` | Posts a command through the engine's own bus and returns the sequence number. |
+| Tool | `engine_status` | A one-call summary: frames, ticks, command counts, thread timings, subsystem availability. |
+| Tool | `recent_commands` | The most recent commands the engine accepted, with source and target. |
+| Resource | `bte://cvars` | Every variable, as a JSON object of name to value. |
+| Resource | `bte://status` | The status summary, as JSON. |
+| Resource | `bte://commands` | The recent command stream, as JSON. |
+| Resource | `bte://help` | The command grammar, as text. |
+| Template | `bte://cvars/{name}` | A single variable, as JSON. |
+
+The log window's own limits are readable too: `log.retained` and `log.overwritten` say how much history
+the window is holding and how much it has had to drop, so a client can tell a quiet engine from one whose
+log has holes in it.
+
+### Why it is built this way
+
+**Variables are readers, not values.** [CvarRegistry.cs](src/BrutalTestEngine/Engine/CvarRegistry.cs)
+holds a delegate per variable, so a client sees the engine as it is at the moment of the call rather
+than a snapshot taken at startup. Each reader is a lambda over the owning object's thread-safe
+accessor, so the value a client reads is the value the engine currently holds.
+
+**One variable describes all the others.** `help` is a registered variable whose value is the whole
+registry rendered as `name = value [kind] description` lines, ordered by name. It is registered last so
+it sees every variable above it, and its reader calls `DescribeAll("help")`, which excludes `help`
+itself. The exclusion is not cosmetic: the reader walks the registry, so without it reading `help`
+would re-enter its own reader and recurse until the stack ran out. `DescribeAll` filters the name list
+*before* invoking any reader, so the excluded variable's reader is never called. Reading `help` is
+therefore a one-call way to see the entire engine state as text, without 110 round trips.
+
+The debug panel does **not** read the registry. It renders a `ConsoleState` value that
+[Engine.cs](src/BrutalTestEngine/Engine/Engine.cs) builds once per frame from direct property reads,
+because the panel needs the numbers grouped and formatted for display rather than one at a time. The
+two surfaces therefore duplicate the same underlying accessors rather than sharing one definition, and
+a new number has to be added in both places. That is a known duplication, not a design goal.
+
+**A tool call is not a privileged path.** `run_command` parses its text with the shared
+[CommandParser](src/BrutalTestEngine/Commands/CommandParser.cs) and posts to the same
+[CommandBus](src/BrutalTestEngine/Commands/CommandBus.cs) as the console, rcon, web and database
+sources. It is attributed to `CommandSource.Mcp`, so per-source policy has something to act on. There
+is no second way into the engine and no MCP-specific command vocabulary to keep in sync.
+
+**Its own thread, and its own transport.** An MCP client is a network peer that may be slow, may
+disconnect mid-request and may hold a connection for hours; none of that may touch a frame or a tick.
+The listener runs on a dedicated thread and each request is handled on the thread pool. The transport
+is **streamable HTTP** rather than stdio, because the engine is a long-running windowed process that
+already owns its stdin (the console source reads it) and whose lifetime must not be tied to a parent
+process. It is configured **stateless**, so a request carries everything needed to answer it and a
+client restart is a non-event.
+
+**Loopback only, and opt-in.** Like the web and rcon sources, the listener binds to `127.0.0.1`. An
+unauthenticated endpoint that can issue commands is a vulnerability on a public interface, so it is
+deliberately not offered. It is off unless `--mcp=PORT` is passed, so a normal run never opens a
+listener.
+
+**The variables are registered only when MCP is enabled.** `RegisterCvars` runs inside the
+`if (options.McpPort is { } mcpPort)` block in `Engine.Create`, so `Engine.Cvars` is empty in a run
+without `--mcp`. That is deliberate — the registry exists to serve the MCP surface, and a host that
+never opens the listener has no reason to pay for the registrations — but it does mean a host cannot
+read `Engine.Cvars` as a general-purpose introspection API unless it also enables MCP. Moving the call
+outside the gate is a one-line change if that becomes the more useful default.
+
+### Reading it back
+
+```sh
+# Every variable, as JSON.
+curl -s http://127.0.0.1:41900/ -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_cvars","arguments":{}}}'
+
+# Every variable as one text blob, in a single call.
+curl -s http://127.0.0.1:41900/ -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_cvar","arguments":{"name":"help"}}}'
+```
+
+Any MCP client works. The engine's own verification uses the official SDK:
+
+```csharp
+var transport = new HttpClientTransport(new HttpClientTransportOptions
+{
+    Endpoint = new Uri("http://127.0.0.1:41900/"),
+    TransportMode = HttpTransportMode.StreamableHttp,
+});
+
+var client = await McpClient.CreateAsync(transport);
+
+// Read the engine as it is right now.
+var frames = await client.CallToolAsync("get_cvar", new() { ["name"] = "engine.frames" });
+
+// Drive it through the same bus every other source uses.
+await client.CallToolAsync("run_command", new() { ["text"] = "tick-rate 90" });
+```
+
+A command is applied by its owning thread on that thread's next drain, so `run_command` returns the bus
+sequence number — the proof it was accepted — and the effect is read back with `get_cvar`. That is the
+whole loop: issue an intent, then read the state it changed, without a screenshot anywhere in it.
 
 ## Commands
 
@@ -497,6 +1176,11 @@ parse the same lines, and `TryFormat` writes them back, so any transport is roun
 | `text <string>`, `focus <gained\|lost>` | Synthetic text and focus events. |
 | `inject <command...>` | Hand a line to the engine to route (see below). |
 | `step <ticks>`, `pause`, `resume`, `reset-simulation` | Drive the simulation without the wall clock. |
+| `capture` | Ask RenderDoc for a GPU frame capture (no-op when it is not attached). |
+| `log-level <level>` | Change the log pipeline's minimum level at runtime. |
+| `add-body [static] [r<radius>] [<x> <y> <z>]` | Add a sphere to the physics world. |
+| `gravity <x> <y> <z>` | Set the physics world's gravity. |
+| `volume <0..1>` | Set the master audio volume. |
 
 `key`, `step` and the rest are not test-only affordances. They are how a remote client, a script or a
 future replay tool drives the engine without owning a keyboard, and they share the parser precisely
@@ -527,6 +1211,7 @@ before anything is exposed.
 | Network | UDP | Strict UTF-8, bounded datagram, malformed frames counted rather than fatal. |
 | Web | HTTP on `--web=PORT` | `?cmd=` or the request body; the index page lists examples. |
 | Database | SQLite on `--database=PATH` | Polls for rows with an `id` greater than the last seen one. |
+| MCP | Streamable HTTP on `--mcp=PORT` | Tool calls and resources; see [MCP](#mcp-live-inspection-for-a-machine). |
 
 ```sh
 # Web: the easiest way to poke a running engine
@@ -670,13 +1355,14 @@ These are not suggestions; every thread in the engine follows them.
 5. **Bound every drain.** `MaxCommandsPerFrame` and `MaxCommandsPerDrain` mean a flooding source
    delays the next frame and not the current one. A queue without a ceiling is a memory leak with a
    longer fuse.
-6. **Use the weakest correct primitive.** `Interlocked` (69 uses) and `volatile` (13) for counters and
+6. **Use the weakest correct primitive.** `Interlocked` (99 uses) and `volatile` (32) for counters and
    flags; `SemaphoreSlim` for blocking handoffs (the ImGui frame ping-pong, the MPSC wake signal) and
    `ManualResetEventSlim` in one place; `ConcurrentQueue`/`ConcurrentDictionary` rather than a locked
-   collection. A `lock` appears only where a compound update genuinely needs mutual exclusion — three
-   `System.Threading.Lock` fields (command sequencing, the command log, the web request history) and
-   two plain `object` gates (the render frame slot, the renderer's pending resize). No `Monitor`, no
-   `ReaderWriterLockSlim`, and never a `lock` on a publicly reachable object.
+   collection. A `lock` appears only where a compound update genuinely needs mutual exclusion — seven
+   `System.Threading.Lock` fields (command sequencing, the command log, the web request history, the
+   thread metrics gate and the timer registry) and five plain `object` gates (the render frame slot,
+   the renderer's pending resize and the host listeners). No `Monitor`, no `ReaderWriterLockSlim`, and
+   never a `lock` on a publicly reachable object.
 7. **Poll with a timeout, and treat the timeout as normal.** Receive and drain loops wait in the 4–16
    ms range so cancellation stays responsive without busy-spinning; the one longer wait (100 ms, on
    the render thread) is a wake-up interval, not a deadline.
@@ -686,6 +1372,12 @@ These are not suggestions; every thread in the engine follows them.
 9. **Never deadlock a UI thread on a worker.** The main thread's wait for the render thread is bounded
    (`FrameConsumeTimeoutMs`), and a minimised window idles instead of blocking on a framebuffer that
    will never arrive.
+10. **A worker that faults must say so.** A thread that catches an exception and stops its own loop is
+    indistinguishable from a healthy idle one unless the failure is reported. `PhysicsThread`,
+    `NetworkThread` and `IoThread` each expose a `Faulted` event; the engine subscribes to the physics
+    and network ones in `Create`, logs the exception and records the message, which the debug panel and
+    the MCP status summary then show. A faulted subsystem is a degraded engine, and it should read as
+    one rather than as silence.
 
 ### Real-time and memory discipline
 
@@ -765,21 +1457,44 @@ dotnet test BrutalTestEngine.slnx
 dotnet run --project src/BrutalTestEngine.Game -- --selftest --validate
 ```
 
+A third gate, free of a GPU and of any judgement call:
+
+```sh
+dotnet format whitespace BrutalTestEngine.slnx --verify-no-changes
+```
+
+[`.editorconfig`](.editorconfig) pins CRLF, four-space indents and a final newline, so this exits
+non-zero if a file drifts. Run it before opening a pull request, not after — an unformatted file is a
+diff you cannot read, which is the whole reason the gate exists.
+
 `dotnet test` runs the NUnit project in [tests/BrutalTestEngine.Tests](tests/BrutalTestEngine.Tests).
 It covers what a headless run cannot see cheaply: that the parser round-trips every command through
 its wire format, that the bus routes each command type to the thread that owns its effect, that
 sequence numbers are dense and unique under concurrent producers, that the queues preserve per-producer
-order and honour their bounds, and that the snapshot handoff never tears. Two of its cases are worth
-calling out because they found real bugs rather than confirming the status quo: a torn read in
-`TripleBuffer` under concurrent publish, a second reader of a buffer documented as single-reader, and a
-non-finite sample that silently poisoned the timing statistics. It also covers the timing arithmetic
-itself — rolling-window means, session-wide maxima, percentile interpolation and rejection of
-non-finite samples — because an operator uses those numbers to decide what to optimise.
+order and honour their bounds, and that the snapshot handoff never tears. Several of its cases are
+worth calling out because they found real bugs rather than confirming the status quo: a torn read in
+`TripleBuffer` under concurrent publish, a second reader of a buffer documented as single-reader, a
+non-finite sample that silently poisoned the timing statistics, and a surplus wake signal in
+`MpscQueue` that made a blocking wait return immediately after a non-blocking drain. It also covers
+the timing arithmetic itself — rolling-window means, session-wide maxima, percentile interpolation and
+rejection of non-finite samples — because an operator uses those numbers to decide what to optimise.
+`WorkerThreadDisposalTests` pins that disposing the physics and audio threads releases the native
+backends they own, and that a faulting world raises `Faulted` and stops the thread.
+`LogEventBufferTests` covers the log window's ring buffer under four concurrent writers, because a torn
+write there would show up as a garbled window rather than as a crash, and `ComputePipelineTests` covers
+the dispatch group arithmetic — the case that silently leaves the tail of a field unprocessed — plus a
+test that fails if the C# local-size constant drifts from the shader's `local_size_x`.
 
 `--selftest` is the end-to-end regression test for the command system: it drives every source from
 outside the engine and fails the run if a command does not land on the right target with the right
 count. `--frames=N` exercises the full startup/render/shutdown path, and `--validate` turns on Vulkan
 validation. Use `--frames` together with `--validate` when changing anything in the renderer.
+
+The compute abstraction is verified the same way, but from inside the engine: the demo field step reads
+its own output back and compares it against the same kernel computed on the CPU, logging
+`compute self-test passed` or `compute self-test FAILED`. A dispatch that silently does nothing produces
+no error and no visible symptom, so a comparison is the only way to know the plumbing works. Run
+`--frames=300` and look for that line after changing anything in [Compute/](src/BrutalTestEngine/Compute/).
 
 The split matters. The unit tests run in a second and need no GPU, so they can gate every commit; the
 self-test boots the real Vulkan device and every thread, so it proves the wiring the tests stub out. A
@@ -794,16 +1509,71 @@ Stated plainly, because an unowned gap is a standard nobody is held to:
 - **No CI workflow.** Tests exist now, but nothing runs them automatically; wiring
   `dotnet test` into a build workflow is the next step.
 - **Test coverage is deliberately narrow.** The tests pin the command and threading layers, which is
-  where the concurrency bugs are. The renderer, the shaders and the Vulkan setup have no unit tests
-  and are covered only by `--frames --validate`.
-- **No `.editorconfig` or `Directory.Build.props`.** Style is currently convention and review, not
-  enforcement. The conventions listed above should be encoded as analyzer rules.
-- **`TreatWarningsAsErrors` is off.** It should be on for a project this size.
+  where the concurrency bugs are, plus the physics/audio seams and worker-thread disposal. The
+  renderer, the shaders and the Vulkan setup have no unit tests and are covered only by
+  `--frames --validate`.
+- **`Directory.Build.props` is still missing.** [`.editorconfig`](.editorconfig) now encodes the
+  style conventions, but the solution-wide build settings belong in a `Directory.Build.props`:
+  `TreatWarningsAsErrors`, `EnforceCodeStyleInBuild`, and warnings-as-errors bounded to the rules
+  listed below. Until that exists, the editor enforces style while `dotnet build` does not.
+- **`EnforceCodeStyleInBuild` is off, and `TreatWarningsAsErrors` is off.** With both on, the
+  `.editorconfig` severities become build failures instead of editor squiggles. The current code
+  already passes with `-p:EnforceCodeStyleInBuild=true`, so turning it on is a one-line change.
+- **The whitespace gate is manual.** `dotnet format whitespace --verify-no-changes` is documented
+  above and currently clean, but nothing runs it; it belongs in the same missing CI workflow as
+  `dotnet test`.
 - **Validation is opt-in.** It should be on by default in Debug builds.
+- **RenderDoc capture is wired but not verified against real RenderDoc.** The load path, the availability
+  probe and the request-to-frame-boundary handoff are tested, and BRUTAL owns the ABI, but a capture has not
+  been written and replayed by the real tool here. The first person to run it under RenderDoc should confirm a
+  `.rdc` file lands with named passes.
+- **Tracy needs no engine code, but no capture script exists.** It hooks Vulkan at the driver level and
+  picks up the debug labels the engine already emits; a documented capture command is still missing.
+- **BRUTAL's Jolt binding faults on `PhysicsSystem.Update`.** Reproduced in isolation and in the engine, on
+  both package versions, in every configuration tried: creating a body succeeds, stepping a world that
+  contains one raises an access violation. That is why physics is opt-in. The seam, the thread and the
+  commands are all written and tested against an in-memory world, so it is a one-line default change once a
+  working binding ships. Filed as an upstream defect rather than worked around with a second physics library.
+  Note that the `Faulted` wiring cannot contain this one: an access violation terminates the process rather
+  than raising a managed exception, so the engine's fault reporting covers managed failures only.
+- **FMOD ships as a managed binding only.** `fmod.dll` is licensed separately and is not redistributable, so
+  audio reports itself unavailable on a fresh checkout. Point `FMOD_DLL` at a copy of the runtime, or drop it
+  beside the executable, to open a device.
+- **No session or reliability policy above the transport.** RakNet carries the bytes and the engine decodes
+  commands, but there is no notion yet of a session, a peer identity, an acknowledgement, a snapshot channel
+  or a reconnection. That policy belongs above the transport line and is future work.
 - **`Brutal.Memory` and `Brutal.Concurrency` are referenced but not yet used directly.** The IO queue
   and triple buffer are hand-rolled for now; per
   [Use BRUTAL's types, don't reinvent them](#use-brutals-types-dont-reinvent-them) they should be
   replaced by the framework's equivalents where one exists.
+- **The entity store is one fixed component set, not a general ECS.** That is a deliberate decision
+  rather than an unfinished one — see
+  [What is deliberately *not* an ECS](#what-is-deliberately-not-an-ecs) — but it does mean adding a
+  component means editing [EntityStore.cs](src/BrutalTestEngine/Simulation/EntityStore.cs) rather than
+  registering a type. The store is the only file that would change.
+- **The MCP surface is read-mostly and unauthenticated.** It exposes every variable and can issue any
+  command, and it is protected only by binding to loopback. That is the right trade for a debugging
+  surface on a developer machine and the wrong one for anything reachable, so authorisation is a
+  prerequisite before it is ever bound to a public interface.
+- **MCP resources are not subscribed.** The server advertises `resources` but not `subscribe`, so a
+  client polls rather than being pushed to. A change notification would need the engine to publish
+  variable changes, which is a real feature rather than a flag.
+- **The debug panel and the cvar registry duplicate their accessors.** The panel renders a
+  `ConsoleState` built from direct property reads; the registry holds lambdas over the same accessors.
+  A new number has to be added in both places, and nothing fails if only one is updated. Sharing one
+  definition would mean the panel reading the registry, which costs a dictionary lookup per field per
+  frame — acceptable, but not free, so the duplication is currently the cheaper trade.
+- **`Engine.Cvars` is empty unless MCP is enabled.** `RegisterCvars` runs inside the MCP gate in
+  `Engine.Create`, so a host that never opens the listener cannot use the registry as a general
+  introspection API. Moving the call outside the gate is a one-line change if that becomes the more
+  useful default.
+- **`Engine.cs` is a large composition root.** It creates eleven collaborators, owns the main loop and
+  builds the console snapshot. Splitting the startup wiring into a builder would shorten it, but the
+  file is also the one place where the whole object graph is visible, which is worth something.
+- **`ICommandHandler` implementations carry no-op stubs.** 84 `Ignore()` bodies across 21 commands and
+  five handler classes exist because the visitor interface requires every handler to name every
+  command. That is the price of "you forgot to handle the new command" being a compile error, and it
+  is currently judged worth paying.
 
 ### Review checklist
 
@@ -815,6 +1585,8 @@ Before a change is considered done:
 - Did you use the BRUTAL type instead of writing your own?
 - Is anything unbounded — a queue, a log, a read, a retry?
 - Does the hot path allocate, parse or format anything it does not have to?
+- Is hot data laid out for the passes that read it — flat arrays, dense, no per-entity heap objects and
+  no virtual dispatch in the loop?
 - Does a new failure mode fail loudly at the edge and get counted inside a loop?
 - Is the *why* recorded, where a reader would otherwise assume the code is wrong?
 - Is it covered by a unit test, or by a headless run (`--frames`, `--selftest`)?
@@ -869,8 +1641,10 @@ loop wants rather than writing new primitives — see
 Keep this **completely API-agnostic** — no `VkBuffer`, no `VkImage`, no shader structs. It represents
 *what exists and how it behaves*.
 
-- **Entity & Component Data (ECS or data-oriented hierarchy):** plain data components — transforms,
-  velocities, health, colliders, renderable/material handles — processed by systems.
+- **Entity & Component Data (data-oriented, not a general ECS):** plain data components — transforms,
+  velocities, health, colliders, renderable/material handles — stored as struct-of-arrays and processed
+  by systems. See [Data-oriented design](#data-oriented-design) for why this is a fixed component set
+  rather than a runtime-composed one.
 - **Fixed-Timestep Physics & Gameplay:** runs on a deterministic step (for example 60 Hz, `dt = 1/60 s`)
   with interpolation for smooth rendering at variable frame rates.
 - **Scene / Spatial Representation:** transform hierarchies and spatial acceleration structures
@@ -906,6 +1680,23 @@ so we never drown in boilerplate.
 - **Batching & Indirect Drawing:** group draw calls by pipeline, material and mesh to minimise state
   changes, and scale up to GPU-driven culling and `vkCmdDrawIndexedIndirect` once basic rendering is
   solid.
+
+#### C. Compute
+
+Compute is a first-class pass type, not an afterthought bolted onto the graphics path, because the
+simulation work that scales — weather, NPC behaviour, crowd density, occlusion queries — is the work that
+belongs on the GPU.
+
+- **The abstraction:** [ComputeShader](src/BrutalTestEngine/Compute/ComputeShader.cs),
+  [ComputeBuffer&lt;T&gt;](src/BrutalTestEngine/Compute/ComputeBuffer.cs) and
+  [ComputePipeline](src/BrutalTestEngine/Compute/ComputePipeline.cs). A pass is a shader, its buffers and
+  a dispatch — see [Compute shaders](#compute-shaders).
+- **Recording:** compute is recorded on the render thread, before the render pass opens, because a render
+  pass is a graphics-only construct. Dependencies between passes are stated as explicit
+  `PipelineBarrier` calls rather than inferred.
+- **Where it goes next:** a frame graph that derives those barriers from declared pass inputs and outputs,
+  so a chain of passes (weather → NPC → crowd) is expressed as data and the barriers are inserted for us.
+  That is the same machinery the graphics passes need, so it is one piece of work, not two.
 
 ### 4. Shaders, Materials & Pipelines
 
@@ -960,14 +1751,15 @@ that should grow into that responsibility, or the work that has not started.
 | 1. Core & Platform — windowing and input | Partial | [Window.cs](src/BrutalTestEngine/Engine/Window.cs) creates the GLFW window, polls events and owns windowed/borderless-fullscreen state. GLFW callbacks are forwarded to [InputThread.cs](src/BrutalTestEngine/Input/InputThread.cs), which folds them into a per-frame [InputSnapshot.cs](src/BrutalTestEngine/Input/InputSnapshot.cs); gamepad input is not captured yet. |
 | 1. Core & Platform — timing and loop | Started | [SimulationThread.cs](src/BrutalTestEngine/Simulation/SimulationThread.cs) runs a fixed-timestep accumulator on its own thread, decoupled from the frame rate, and reports its measured rate and dropped ticks. |
 | 1. Core & Platform — memory and jobs | Partial | `Brutal.Memory` and `Brutal.Concurrency` are referenced but not yet used directly. [IoThread.cs](src/BrutalTestEngine/Io/IoThread.cs) provides a background work queue, but there is no general job system or frame-scoped allocator. |
-| 2. Simulation & World | Minimal | [SimulationThread.cs](src/BrutalTestEngine/Simulation/SimulationThread.cs) holds the whole world state — a rotation and a scale — and publishes it as an immutable [SimulationSnapshot.cs](src/BrutalTestEngine/Simulation/SimulationSnapshot.cs). No ECS, scene representation or spatial queries. It stays free of Vulkan types. |
+| 2. Simulation & World | Minimal | [SimulationThread.cs](src/BrutalTestEngine/Simulation/SimulationThread.cs) runs the fixed-timestep tick and steps [EntityStore.cs](src/BrutalTestEngine/Simulation/EntityStore.cs), a struct-of-arrays store, then publishes an immutable [SimulationSnapshot.cs](src/BrutalTestEngine/Simulation/SimulationSnapshot.cs). No scene representation or spatial queries yet. It stays free of Vulkan types. |
 | 2. Render extraction (Frame Packet) | Partial | The renderer still owns the triangle's vertex data, but the per-frame state it draws from now arrives as a `SimulationSnapshot` rather than being read directly. A `RenderView`/`FramePacket` type is the intended boundary between simulation and rendering. |
 | 3. Rendering & Vulkan RHI — device and swapchain | Started | [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs) builds the instance, surface, device, queues and swapchain; [SwapchainState.cs](src/BrutalTestEngine/Engine/SwapchainState.cs) groups everything rebuilt on resize. |
-| 3. Rendering & Vulkan RHI — allocator | Started | Vertex data goes through VMA in [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs); there is no general GPU resource abstraction yet. |
+| 3. Rendering & Vulkan RHI — allocator | Started | Vertex data goes through VMA in [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs), and [ComputeBuffer.cs](src/BrutalTestEngine/Compute/ComputeBuffer.cs) wraps a typed VMA allocation for compute. There is no general GPU resource abstraction yet. |
 | 3. Rendering & Vulkan RHI — frames in flight | Started | Two frames in flight in [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs), each with its own command buffer, acquire semaphore and fence; the render-finished semaphores are per swapchain image instead. Fences are keyed on the frame slot rather than the acquired image. |
 | 3. Rendering & Vulkan RHI — passes and draw submission | Started | A single render pass (clear → triangle → ImGui → present), recorded on the render thread by [RenderThread.cs](src/BrutalTestEngine/Engine/RenderThread.cs). No shadow, depth or post-processing passes, and no batching or indirect drawing. |
-| 3. Synchronisation & render graph | Not started | Barriers are written by hand in [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs). A render graph would declare pass inputs/outputs and insert them automatically. |
-| 4. Shaders, Materials & Pipelines | Minimal | [TriangleShaders.cs](src/BrutalTestEngine/Shaders/TriangleShaders.cs) holds GLSL compiled at runtime with ShaderC, and the pipeline is created inline. No SPIR-V reflection, pipeline cache, hot-reload or material system. |
+| 3. Rendering & Vulkan RHI — compute | Started | [ComputePipeline.cs](src/BrutalTestEngine/Compute/ComputePipeline.cs) owns a compute pass end to end, and the demo field step proves it by reading its output back and comparing it against the CPU. No frame graph, so barriers are still written by hand. |
+| 3. Synchronisation & render graph | Not started | Barriers are written by hand in [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs), including the one after the compute dispatch. A render graph would declare pass inputs/outputs and insert them automatically. |
+| 4. Shaders, Materials & Pipelines | Minimal | [TriangleShaders.cs](src/BrutalTestEngine/Shaders/TriangleShaders.cs) and [ComputeShaders.cs](src/BrutalTestEngine/Shaders/ComputeShaders.cs) hold GLSL compiled at runtime with ShaderC, and pipelines are created inline. No SPIR-V reflection, pipeline cache, hot-reload or material system. |
 | 5. Asset Pipeline & Tooling | Not started | No cooker, no binary formats, no streaming. [Vertex.cs](src/BrutalTestEngine/Engine/Vertex.cs) defines the one vertex format the triangle uses. ImGui already provides an in-engine debug UI to build on. |
 
 The order this project intends to grow in: finish layer 1 (gamepad input, frame-scoped memory), add

@@ -306,6 +306,16 @@ public class CommandBusTests
 
         public void Handle(ResetSimulationCommand command) { }
 
+        public void Handle(CaptureFrameCommand command) { }
+
+        public void Handle(SetLogLevelCommand command) { }
+
+        public void Handle(AddBodyCommand command) { }
+
+        public void Handle(SetGravityCommand command) { }
+
+        public void Handle(SetVolumeCommand command) { }
+
         public void Handle(UnhandledCommand command) => LastUnhandledText = command.Text;
     }
 }

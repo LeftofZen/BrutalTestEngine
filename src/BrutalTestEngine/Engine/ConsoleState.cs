@@ -1,4 +1,5 @@
 using BrutalTestEngine.Commands;
+using BrutalTestEngine.Logging;
 
 namespace BrutalTestEngine.Engine;
 
@@ -69,6 +70,18 @@ public sealed class ConsoleState
     /// <summary>Commands posted from watched database rows.</summary>
     public required long DatabaseCommands { get; init; }
 
+    /// <summary>MCP listener port, when enabled.</summary>
+    public required int? McpPort { get; init; }
+
+    /// <summary>Variables the MCP server exposes.</summary>
+    public required int McpCvarCount { get; init; }
+
+    /// <summary>MCP requests received.</summary>
+    public required long McpRequests { get; init; }
+
+    /// <summary>Commands posted from MCP tool calls.</summary>
+    public required long McpCommands { get; init; }
+
     /// <summary>Completed database poll cycles.</summary>
     public required long DatabasePolls { get; init; }
 
@@ -87,9 +100,75 @@ public sealed class ConsoleState
     /// <summary>Slowest engine drain seen so far, in milliseconds.</summary>
     public required double MaxEngineDrainMilliseconds { get; init; }
 
-        /// <summary>
-        /// Per-thread timing for the session, ordered by key. Shared by reference rather than copied because
-        /// the panel only reads it for display; nothing here mutates it.
-        /// </summary>
-        public required KeyValuePair<string, ThreadMetrics>[] ThreadTimings { get; init; }
+    /// <summary>Name of the network transport the engine is running on, e.g. "raknet".</summary>
+    public required string NetworkTransport { get; init; }
+
+    /// <summary>Endpoint the network transport is bound to.</summary>
+    public required string NetworkEndpoint { get; init; }
+
+    /// <summary>The most recent network thread failure, or <c>null</c> when it has not faulted.</summary>
+    public required string? NetworkFault { get; init; }
+
+    /// <summary>True when the Vulkan debug messenger and debug labels are active.</summary>
+    public required bool TracingEnabled { get; init; }
+
+    /// <summary>True when RenderDoc's in-application API is available.</summary>
+    public required bool RenderDocAvailable { get; init; }
+
+    /// <summary>The RenderDoc version, when it is attached.</summary>
+    public required string? RenderDocVersion { get; init; }
+
+    /// <summary>Captures RenderDoc has written this session.</summary>
+    public required uint CaptureCount { get; init; }
+
+    /// <summary>The log pipeline's current minimum level.</summary>
+    public required string LogLevel { get; init; }
+
+    /// <summary>Log events dropped because the asynchronous buffer was full.</summary>
+    public required long LogDroppedCount { get; init; }
+
+    /// <summary>
+    /// The most recent log events, oldest first. Owned by the engine and reused each frame, exactly like
+    /// <see cref="Commands"/>.
+    /// </summary>
+    public required LogEntry[] LogEvents { get; init; }
+
+    /// <summary>Number of valid entries in <see cref="LogEvents"/>.</summary>
+    public required int LogEventCount { get; init; }
+
+    /// <summary>Log events overwritten in the window's ring buffer because it was full.</summary>
+    public required long LogEventOverwrittenCount { get; init; }
+
+    /// <summary>The most recent physics thread failure, or <c>null</c> when it has not faulted.</summary>
+    public required string? PhysicsFault { get; init; }
+
+    /// <summary>Name of the physics backend, e.g. "jolt".</summary>
+    public required string PhysicsBackend { get; init; }
+
+    /// <summary>True when a physics backend initialized and can be stepped.</summary>
+    public required bool PhysicsAvailable { get; init; }
+
+    /// <summary>Bodies currently in the physics world.</summary>
+    public required int PhysicsBodies { get; init; }
+
+    /// <summary>Physics steps performed this session.</summary>
+    public required long PhysicsSteps { get; init; }
+
+    /// <summary>Name of the audio backend, e.g. "fmod".</summary>
+    public required string AudioBackend { get; init; }
+
+    /// <summary>True when an audio device was opened.</summary>
+    public required bool AudioAvailable { get; init; }
+
+    /// <summary>Channels the mixer is currently playing.</summary>
+    public required int AudioChannels { get; init; }
+
+    /// <summary>Mixer updates performed this session.</summary>
+    public required long AudioUpdates { get; init; }
+
+    /// <summary>
+    /// Per-thread timing for the session, ordered by key. Shared by reference rather than copied because
+    /// the panel only reads it for display; nothing here mutates it.
+    /// </summary>
+    public required KeyValuePair<string, ThreadMetrics>[] ThreadTimings { get; init; }
 }

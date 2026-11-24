@@ -75,9 +75,9 @@ public class ThreadTimerRegistryTests
             Assert.That(() => timers.Get(string.Empty), Throws.ArgumentException);
             Assert.That(() => timers.Get("   "), Throws.ArgumentException);
 
-                // ArgumentNullException derives from ArgumentException, so this would pass either way; the
-                // point is that a null key is rejected rather than silently creating a metric named "null".
-                Assert.That(() => timers.Get(null!), Throws.ArgumentNullException);
+            // ArgumentNullException derives from ArgumentException, so this would pass either way; the
+            // point is that a null key is rejected rather than silently creating a metric named "null".
+            Assert.That(() => timers.Get(null!), Throws.ArgumentNullException);
         });
     }
 
@@ -124,7 +124,7 @@ public class ThreadTimerRegistryTests
         {
             Assert.That(keys, Is.Not.Empty);
             Assert.That(keys, Has.All.Not.Null.And.Not.Empty);
-                    Assert.That(keys.Distinct().ToArray(), Has.Length.EqualTo(keys.Length));
+            Assert.That(keys.Distinct().ToArray(), Has.Length.EqualTo(keys.Length));
         });
     }
 
