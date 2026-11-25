@@ -100,14 +100,32 @@ public sealed unsafe class ComputeBuffer<T> : IDisposable
     /// against the GPU: the caller must not upload to a buffer the GPU is still reading. In this engine that
     /// is guaranteed by construction, because uploads happen on the render thread between frames.
     /// </remarks>
-    public void Upload(ReadOnlySpan<T> data)
+    public void Upload(ReadOnlySpan<T> data) => Upload(data, 0);
+
+    /// <summary>
+    /// Writes <paramref name="data"/> into the buffer starting at <paramref name="destinationOffset"/>.
+    /// </summary>
+    /// <remarks>
+    /// The offset overload exists for pools that are written a piece at a time. A pool large enough to hold
+    /// every resident object is far larger than what changes in a frame, so re-uploading all of it would
+    /// spend the frame's bandwidth on bytes that did not move.
+    /// </remarks>
+    public void Upload(ReadOnlySpan<T> data, int destinationOffset)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        ArgumentOutOfRangeException.ThrowIfGreaterThan(data.Length, ElementCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(destinationOffset);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(destinationOffset + data.Length, ElementCount);
 
-        data.CopyTo(new Span<T>((void*)_allocationInfo.PMappedData, ElementCount));
-        // A no-op on host-coherent memory, required otherwise.
-        _allocator.FlushAllocation(Allocation, ByteSize.Zero, Size);
+        var mapped = new Span<T>((void*)_allocationInfo.PMappedData, ElementCount);
+        data.CopyTo(mapped[destinationOffset..]);
+
+        // A no-op on host-coherent memory, required otherwise. Flushing only the written range keeps the
+        // cost proportional to the upload rather than to the pool.
+        _allocator.FlushAllocation(
+            Allocation,
+            ByteSize.Of<T>(destinationOffset),
+            ByteSize.Of<T>(data.Length)
+        );
     }
 
     /// <summary>

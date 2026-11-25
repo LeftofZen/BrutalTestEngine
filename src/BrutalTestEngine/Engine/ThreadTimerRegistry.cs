@@ -80,6 +80,18 @@ public sealed class ThreadTimerRegistry
 
         /// <summary>Handling one MCP request, from parse to reply.</summary>
         public const string McpRequest = "mcp.request";
+
+        /// <summary>Building one brick on a world-generation worker: field, extraction and splitting.</summary>
+        public const string WorldBuild = "world.build";
+
+        /// <summary>A world-generation worker waiting for a job to arrive.</summary>
+        public const string WorldWait = "world.wait";
+
+        /// <summary>One streamer pass: deciding which bricks a level needs and requesting them.</summary>
+        public const string WorldStream = "world.stream";
+
+        /// <summary>Committing a worker's finished geometry into the destination pools.</summary>
+        public const string WorldCommit = "world.commit";
     }
 
     private readonly Dictionary<string, ThreadMetrics> _metrics = new(StringComparer.Ordinal);

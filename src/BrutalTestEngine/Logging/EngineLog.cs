@@ -106,6 +106,9 @@ public static class EngineLog
 
         /// <summary>The MCP server: its listener, its tool calls and its faults.</summary>
         public static readonly LogCategory Mcp = LogCategory.Make("engine.mcp");
+
+        /// <summary>World generation: the streamer and the brick-building workers.</summary>
+        public static readonly LogCategory World = LogCategory.Make("engine.world");
     }
 
     /// <summary>True once <see cref="Initialize"/> has run.</summary>

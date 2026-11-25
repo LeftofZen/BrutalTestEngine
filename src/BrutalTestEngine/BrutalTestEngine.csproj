@@ -11,6 +11,12 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+      <ItemGroup>
+        <!-- Lets the test project reach the handful of internal pure functions that exist only so they can be
+             tested without a live Vulkan device or a real HttpListener. Nothing else is internal. -->
+        <InternalsVisibleTo Include="BrutalTestEngine.Tests" />
+      </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Ahwoo.BRUTAL.Core" Version="2026.10.4" />
     <PackageReference Include="Ahwoo.BRUTAL.Fmod" Version="2026.10.4" />

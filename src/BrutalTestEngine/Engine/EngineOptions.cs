@@ -121,4 +121,25 @@ public sealed record EngineOptions
     /// Used to prove the command system end to end in a single run.
     /// </summary>
     public bool RunCommandSelfTest { get; init; }
+
+    /// <summary>
+    /// The world's shape, or <c>null</c> for <see cref="World.WorldSettings.Default"/>.
+    /// </summary>
+    /// <remarks>
+    /// Exposed so a host can shrink the clipmap for a quick run. The default is nine levels of twelve bricks
+    /// per axis, which is a view distance of nearly twenty-five kilometres and takes a few seconds of worker
+    /// time to fill in from cold.
+    /// </remarks>
+    public World.WorldSettings? World { get; init; }
+
+    /// <summary>
+    /// The world job system's tuning, or <c>null</c> for <see cref="Jobs.WorldJobSystemOptions.Default"/>.
+    /// </summary>
+    public Jobs.WorldJobSystemOptions? WorldJobs { get; init; }
+
+    /// <summary>
+    /// Whether to generate and draw the world at all. On by default; off is useful for isolating a rendering
+    /// problem from the world pipeline.
+    /// </summary>
+    public bool EnableWorld { get; init; } = true;
 }

@@ -1,4 +1,4 @@
-﻿# Brutal Test Engine
+# Brutal Test Engine
 
 A minimal .NET 10 game engine built on the [BRUTAL](https://github.com/ahwootech/BRUTAL) framework.
 It opens a GLFW window, renders a triangle with Vulkan, and draws a Dear ImGui debug panel over it.
@@ -99,8 +99,12 @@ engine library only, so a game inherits them by referencing the engine once.
 - Compiles two inline GLSL shaders at runtime with ShaderC and draws a coloured triangle from a
   VMA-allocated vertex buffer.
 - Runs compute passes through a small abstraction — a compiled shader, a typed buffer and a pipeline that
-  owns its descriptor set — and verifies the demo pass by reading its output back and comparing it against
-  the same kernel on the CPU — see [Compute shaders](#compute-shaders).
+  owns its descriptor set — and verifies each one by reading its output back and comparing it against a CPU
+  reference — see [Compute shaders](#compute-shaders).
+- Builds the world as an SDF brick-clipmap, extracts each surface brick's geometry with Surface Nets and
+  splits it into GPU meshlets with bounding spheres and normal cones, classifying bricks on the GPU and
+  verifying that pass against its CPU reference per brick — see
+  [The world](#the-world-sdf-brick-clipmaps-and-gpu-meshlets).
 - Runs Dear ImGui with the GLFW and Vulkan backends, recording its draw lists into the same render
   pass so the debug panel composites over the scene.
 - Shows frame time, FPS, framebuffer size and the Vulkan device name, with a toggle for the ImGui
@@ -188,6 +192,7 @@ over one authoritative simulation, so the engine cannot be allowed to assume it 
 
 ```
 BrutalTestEngine.slnx
+.vscode                        editor setup: MCP registration, tasks and launch profiles
 src/BrutalTestEngine           the engine library (net10.0, OutputType=Library)
 ├── Engine
 │   ├── EngineOptions.cs       title, size, frame limit, tick rate, tracing, transport, capture
@@ -198,6 +203,8 @@ src/BrutalTestEngine           the engine library (net10.0, OutputType=Library)
 │   ├── VulkanDebugMessenger.cs routes validation/debug-utils messages into the log
 │   ├── RenderDocCapture.cs    RenderDoc's in-application API, via BRUTAL's binding
 │   ├── SwapchainState.cs      everything rebuilt when the swapchain is recreated
+│   ├── RenderTargetImage.cs   a captured frame, and its PNG encoding
+│   ├── PngEncoder.cs          a minimal PNG writer, so a capture needs no imaging library
 │   ├── RenderThread.cs        the render thread and the main↔render frame handshake
 │   ├── ImGuiVulkanRenderer.cs the ImGui Vulkan backend, owned by the render thread
 │   ├── DebugUi.cs             ImGui context, GLFW backend and the debug panel (main thread)
@@ -238,6 +245,22 @@ src/BrutalTestEngine           the engine library (net10.0, OutputType=Library)
 │   ├── SimulationThread.cs    fixed-timestep tick loop
 │   ├── EntityStore.cs         struct-of-arrays entity storage: the data-oriented core
 │   └── SimulationSnapshot.cs  immutable view of the simulation for other threads
+├── World
+│   ├── WorldSettings.cs       level count, brick shape and metric scale, and their bounds
+│   ├── ClipmapLevel.cs        one ring: its metric, its anchor and integer slot addressing
+│   ├── SdfClipmap.cs          the levels, the re-centring rule and the level-selection rule
+│   ├── BrickKey.cs            a brick's identity: its level and its lattice coordinate
+│   ├── SdfBrick.cs            the field block, its neighbour ring and the cell tables
+│   ├── SurfaceNetExtractor.cs field block to mesh, watertight across brick boundaries
+│   ├── BrickMesh.cs           the extracted mesh and the octahedral normal encoding
+│   ├── MeshletBuilder.cs      mesh to bounded meshlets, with bounding spheres and cones
+│   ├── MeshletArena.cs        the run-length GPU arena meshlets are packed into
+│   ├── BrickShape.cs          the hardware budgets and the geometry bounds they imply
+│   ├── SdfBrickPool.cs        the indirection table and the free list
+│   ├── DirtyBrickSet.cs       which bricks need rebuilding, and the edit overlap query
+│   ├── SdfBrickStore.cs       the CPU pipeline, from a clipmap slot to meshlets in the pools
+│   ├── BrickClassifier.cs     the CPU reference for the GPU classification pass
+│   └── TerrainField.cs        the demonstration terrain the self-test runs on
 ├── Input
 │   ├── InputThread.cs         folds commands into a per-frame input snapshot
 │   ├── InputCommands.cs       GLFW callback vocabulary → commands
@@ -259,7 +282,6 @@ src/BrutalTestEngine           the engine library (net10.0, OutputType=Library)
 └── Shaders
     ├── TriangleShaders.cs     inline GLSL for the demo triangle, compiled at runtime
     └── ComputeShaders.cs      inline GLSL for the compute passes, compiled at runtime
-
 src/BrutalTestEngine.Game      the game's executable: references the engine and owns Main
 └── Program.cs                 argument parsing, logging bootstrap, error handling, exit codes
 
@@ -271,6 +293,7 @@ tests/BrutalTestEngine.Tests   NUnit tests over the engine's concurrency and com
 ├── Logging/…                  the zero-allocation disabled path, runtime level changes, the log ring buffer
 ├── Networking/…               a fake transport proving the engine is not tied to UDP
 ├── Simulation/…               the entity store's layout, swap-remove and allocation-free step
+├── World/…                    clipmap anchoring, brick extraction, meshlet budgets, watertightness
 └── Threading/…                queue and triple-buffer behaviour under contention
 ```
 
@@ -678,9 +701,11 @@ to leave in a launch profile.
 
 ## Compute shaders
 
-The engine will lean on compute heavily — weather simulation, NPC simulation, crowd density, influence
-maps — so the abstraction exists to make those passes a shader swap rather than new plumbing. It lives in
-[src/BrutalTestEngine/Compute/](src/BrutalTestEngine/Compute/).
+The engine leans on compute heavily — weather simulation, NPC simulation, crowd density, influence maps —
+so the abstraction exists to make those passes a shader swap rather than new plumbing. It lives in
+[src/BrutalTestEngine/Compute/](src/BrutalTestEngine/Compute/). Two passes already run through it: a
+demonstration field step, and the brick classification pass that decides whether a world brick contains any
+terrain at all.
 
 Three types, each owning one thing:
 
@@ -751,6 +776,281 @@ The field is 4096 elements at 64 invocations per workgroup, so the dispatch span
 the group arithmetic has to get right. The managed-side arithmetic is unit-tested in
 [ComputePipelineTests.cs](tests/BrutalTestEngine.Tests/Compute/ComputePipelineTests.cs), including a test
 that fails if the C# local-size constant drifts from the shader's `local_size_x`.
+
+## The world: SDF brick-clipmaps and GPU meshlets
+
+The world is a **signed distance field** sampled into a **clipmap of bricks**, rasterised as **GPU
+meshlets**. Each of the three is doing one job, and the design is the way each one makes the other two
+affordable.
+
+### Why not one grid, or one mesh, or one texture
+
+The requirement is a seamless open world with a view distance of kilometres and voxel detail at arm's
+length nearby. Three naive answers and why each fails:
+
+- **One grid at the finest resolution, all the way out.** Not a trade-off, an impossibility. Every rung of
+  distance halves the cell size needed to keep the same screen-space density, which costs a factor of
+  eight in voxels. A modest 8 km view at half-metre voxels is roughly eight billion voxels.
+- **One dense 3D texture of distances.** Terrain is almost entirely either air or solid rock, and neither
+  has a surface in it. A dense texture spends its memory on the parts of the world nothing will ever be
+  drawn from — typically two orders of magnitude more memory than the surface itself needs.
+- **One monolithic mesh, extracted on the CPU and re-extracted on edit.** A carve or a collapse invalidates
+  a mesh that took seconds to build, so interaction and destruction — the whole point of a distance field —
+  become impossible.
+
+The clipmap answers the first, bricks answer the second, and meshlets answer the third.
+
+### The clipmap
+
+Nested, concentric grids, re-anchored around the point being streamed. Level 0 is finest and covers the
+least ground; each level out halves in resolution and doubles in extent. With the defaults — a base brick
+of 8 m, 8 bricks per axis, nine levels — level 0 resolves 1 m voxels across 64 m, and level 8 resolves
+256 m voxels across 16 km.
+
+The important property is not the nesting, it is the **snapping**. A level is re-anchored only when the
+streaming point crosses a whole brick boundary, so the brick under a given piece of terrain keeps the same
+key and the same slot from frame to frame. Without the quantisation nothing would ever be cacheable and the
+design would collapse back into re-generating the world every frame.
+
+The clipmap is centred on the **terrain surface** under the camera's horizontal position, not on the camera
+itself. That is not cosmetic: the levels are nested cubes, so the finest level only owns what falls inside
+its own small cube. Centring that cube at flying altitude pushes the whole terrain band outside it, and the
+world then resolves at tens of metres per brick with gaps between them. A heightfield's finest detail
+belongs where the ground is.
+
+A brick's voxels are derived to fill it exactly — `BaseVoxelSize` is `BaseBrickSize / BrickVoxelCount`
+rather than an independent setting. Bricks sit on a lattice spaced by the brick size while their geometry
+only spans the voxel grid, so a voxel size that did not fill the brick would leave a gap between every pair
+of neighbours and the world would draw as detached islands. Storing the two sizes separately made that bug
+reachable by a configuration change; deriving one from the other makes it unrepresentable.
+
+Anchors are stored as **brick lattice coordinates**, and every piece of addressing is exact integer work;
+only the final conversion to metres touches floating point. A world position multiplied by a brick size
+overflows a `float`'s exact integer range well inside a large world, so a level's origin is carried as its
+own term and a brick's coordinate is relative to it. That is the same decision the shader makes, and it is
+why the pass takes an origin in its push constants.
+
+### Who owns a brick
+
+Every world point resolves to exactly one level, and both the request pass and the eviction pass enforce
+that same rule. This has to be symmetrical or the world churns: a brick requested on a level that does not
+own it gets built, then evicted, then rebuilt, forever. Two related invariants keep the stream filling in:
+
+- **A brick being built is not a stale brick.** Eviction keys off "is this slot still wanted in the current
+  generation", not "does it have geometry yet" — a freshly requested brick has no geometry for its entire
+  flight, so the latter test evicts every request before its worker can finish.
+- **Slots are global across the hierarchy.** The pool has one table entry per slot of *every* level, so the
+  streamer must pass `level × bricksPerLevel + slot`. Passing the per-level index makes all nine levels
+  share level 0's 512 entries, and the hierarchy can then never hold more than a single level's worth of
+  geometry no matter how many bricks it asks for.
+
+### The bricks
+
+A brick is 8³ voxels of distances. It is stored with a **one-voxel ring of neighbour data** —
+`(n + 2)³` samples for an `n³` brick — and the ring is not padding, it is what makes the mesh watertight.
+Surface extraction emits a polygon per grid edge the surface crosses, and a boundary edge's polygon needs
+the two cells on the far side, which live in the neighbouring brick. Without the ring every brick boundary
+would show as a crack.
+
+Only bricks the surface passes through are allocated. A brick of air and a brick of solid rock are
+identical in cost — zero — which is what turns "one slot per grid cell" into "one slot per *surface* cell",
+one to two orders of magnitude less memory and less work.
+
+The stores are sized from real bounds rather than guesses: no level can hold more bricks than its grid has
+cells, so the pool's capacity is `bricksPerLevel × levelCount`, exactly.
+
+### The meshlets
+
+A meshlet is a micro-mesh of at most **64 vertices and 124 triangles** — the limits a mesh shader
+workgroup advertises on Turing/Ada and RDNA — carrying its own **bounding sphere** and **normal cone**. The
+cone is what makes GPU-driven rendering worthwhile: a task shader rejects a meshlet whose triangles all
+face away before a single vertex is shaded, and rejection is per-micro-mesh rather than per-object.
+
+**One brick is several meshlets, and that is arithmetic rather than an oversight.** An 8³ brick can place a
+vertex in any of `9³ = 729` cells, so a single brick cannot fit one meshlet's 64-vertex budget; the earlier
+"one brick, one meshlet" premise is false and the code says so. The actual premise is that a brick maps to a
+small *bounded* number of meshlets, and the split is mechanical: triangles in order, greedily, with a
+running vertex count. Two properties make that exact rather than approximate.
+
+A vertex is local to the meshlet that first used it and is **copied** into any later meshlet that needs it,
+so a meshlet's vertex range is exactly its own and a task shader needs no lookup to find it. And a triangle
+needs at most three vertices, so a fresh meshlet always has room and the loop always progresses.
+
+Meshlets are packed at a **fixed stride** rather than densely, so a meshlet's pool offsets are a pure
+function of its ordinal and neither the split nor the draw needs running-offset bookkeeping. The cost is a
+little slack per meshlet, which is nothing next to a second level of indirection on the GPU.
+
+Vertices are **4 bytes**: three of quantised position across the brick's expanded local range, one of
+octahedral normal, four bits per axis. The octahedral mapping folds the sphere onto a square, so both
+directions are branch-free arithmetic rather than a table — which matters because the decode runs in the
+mesh shader once per vertex.
+
+### The pipeline
+
+```mermaid
+flowchart LR
+    A["Recentre<br/>snap levels in whole bricks"] --> B["Classify<br/>compute, one invocation per brick"]
+    B --> C{"Surface<br/>passes through?"}
+    C -->|no| D["Nothing<br/>no slot, no memory, no meshlet"]
+    C -->|yes| E["Allocate a brick id<br/>from the pool"]
+    E --> F["Job queue<br/>bounded MPSC ring"]
+    F --> G["Worker threads<br/>sample + extract, Surface Nets"]
+    G --> H["Split<br/>bounded meshlets, sphere + cone"]
+    H --> I["Commit<br/>arena run + dirty range"]
+    I --> J["Upload<br/>only the dirty byte range"]
+    J --> K["Draw<br/>one vkCmdDraw per meshlet"]
+    K --> L["Task shader culls<br/>frustum, Hi-Z, cone — future"]
+```
+
+Recentre, classify and the dirty set are what make this a stream of work proportional to what *changed*
+rather than to what exists. A camera at rest produces nothing; a camera crossing one brick boundary
+produces one brick per level whose anchor moved.
+
+The split between threads is the engine's first principle applied to the world: the frame thread decides
+*what* is needed and never waits for it, the workers decide *how* and run at their own pace, and the render
+thread consumes a snapshot. The only lock in the pipeline is the job queue's, held for a few hundred
+nanoseconds around two index updates.
+
+### What is proven, and what is not
+
+The design has five stages, and claiming all five are finished would be false. The honest split:
+
+**Implemented, tested, and running — the world is generated and drawn.**
+
+A clipmap of bricks is streamed around the camera on a job system of worker threads, meshed with Surface
+Nets, split into meshlets, uploaded to GPU pools, and drawn by a real graphics pipeline. The demo app shows
+terrain.
+
+- Clipmap geometry, anchoring, integer slot addressing and the level-selection rule.
+- The brick pool, the indirection table and the free list.
+- Dirty-brick tracking, including the sphere-overlap query an edit uses.
+- The field block, with its ring, gradient and the single definition of the cell tables.
+- **Surface Nets extraction**, manifold by construction, with the brick boundary emitted exactly once by
+  the brick on its negative side.
+- **The meshlet splitter**, with budgets, bounding spheres and normal cones.
+- **The brick classification pass on the GPU**, verified against its CPU reference per brick at startup.
+- The CPU brick pipeline end to end, from a clipmap slot to meshlets in the pools.
+- **Asynchronous world generation.** A bounded multi-producer job queue feeds a pool of worker threads, each
+  owning its own brick store so there is no lock in the meshing path. Completions are committed on the frame
+  thread under a per-frame budget, so a burst of finished bricks cannot surface as a hitch.
+- **A run-length meshlet arena.** Bricks are variable-sized, so their meshlets are packed into a shared
+  arena rather than at a fixed per-brick stride, and an evicted brick returns its run to the free list.
+  The arena's run-length allocator is what keeps a streaming world's GPU buffers bounded.
+- **The terrain draw path**: a graphics pipeline reading vertices and indices from storage buffers, a depth
+  attachment, per-brick push constants carrying the world transform, and a single draw per meshlet.
+
+One caveat belongs here rather than in the list below, because it is easy to read the list above as
+"the LOD hierarchy works". It does not yet: bricks are requested at the finest level only, so what you see
+is a single 64 m cube of 1 m voxels with nothing outside it. The clipmap, its levels and the selection rule
+are all implemented and tested — the outer levels are simply not asked for geometry.
+
+**Designed and scaffolded, not yet on the GPU.**
+
+- Extraction and splitting as compute shaders. The CPU versions exist precisely so the GPU versions have
+  something to be tested against, which is the discipline the classification pass already follows.
+- The task and mesh shader stages. BRUTAL exposes what they need — `VkShaderStageFlags.MeshBitEXT` and
+  `TaskBitEXT`, `VkPhysicalDeviceMeshShaderFeaturesEXT` and `VkDrawMeshTasksIndirectCommandEXT` were all
+  confirmed present in the package — but no pipeline is built against them yet. Today's draws are plain
+  `vkCmdDraw` per meshlet.
+- Dirty-brick *rebuild* on the GPU. The tracking exists; the pass that consumes the set does not.
+
+**Deliberately not started.** Hi-Z occlusion, LOD transitions between levels, the shading model (the terrain
+uses a diagnostic height and slope palette), and the streaming that will replace the fixed clipmap once the
+world is bigger than the view distance.
+
+### Why Surface Nets
+
+Three candidate algorithms, and the choice was made on a property none of the other two share:
+
+- **Marching Cubes** has 256 cases, and its classic ambiguous ones can produce holes. A hole in this design
+  is a crack at a brick boundary, and brick boundaries are everywhere. Rejected.
+- **Dual Contouring** puts a vertex anywhere in a cell and can therefore represent a sharp crease. That is
+  the right answer for a carved wall and the wrong one for terrain, which wants smooth. Its extra machinery
+  — solving a quadratic error function per cell — buys nothing here and costs a lot.
+- **Surface Nets** emits one vertex per crossed cell at the mass centroid of the crossings, and one quad per
+  crossed grid edge. Every edge ends up in exactly two faces with no case table to get wrong, and the vertex
+  count is bounded by the cell count, which is what lets the mesh's buffers be sized once.
+
+Where sharpness is wanted later, the answer is a finer clipmap level rather than a different algorithm, and
+the clipmap already provides those near the camera.
+
+### The tie-break that matters
+
+A sample of exactly zero is treated as **outside** the surface. This is not an edge case to tolerate: terrain
+on a whole-metre voxel grid lands exactly on zero constantly, and the crossing test, the interpolation, the
+GPU classification and the CPU extraction all have to make the same choice or the two halves of the pipeline
+will disagree about which cells own the surface. The rule lives in one place, `SdfBrick.HasCrossing`, and
+everything else calls it.
+
+### Two invariants the extractor has to get right, and how they are pinned
+
+Both of these were wrong in the first working version, and neither produced a validation error, an exception
+or a log line. The terrain simply drew as scattered specks.
+
+**A vertex belongs at its cell's origin plus the centroid of its crossings.** The centroid is a fraction of a
+cell; without the cell's integer position added back, every vertex in every brick decodes to the same point
+near the brick's minimum corner. The mesh is then a one-voxel patch repeated at the origin of each brick,
+which is exactly what "scattered specks" looks like.
+
+**A triangle's winding follows the sign of the field change, not a fixed axis order.** Getting it backwards
+does not make the mesh disappear — the vertices are in the right place — it makes every triangle face away
+from the camera, so back-face culling silently discards the entire world.
+
+Neither is detectable by looking at a noisy terrain field, because such a field produces triangles facing
+every direction and any property you could measure over it is a majority rather than an invariant. The test
+that pins them builds **analytic plane fields** — `dx·x + dy·y + dz·z` — where the zero set is a known plane
+and the outward direction is known per axis, so *every* triangle must satisfy the same sign test, and every
+vertex must land on the plane.
+[SurfaceNetWindingPlaneTests.cs](tests/BrutalTestEngine.Tests/World/SurfaceNetWindingPlaneTests.cs) covers
+all three axes plus a vertex-spread check, and it is the test that caught both bugs — the vertex-collapse
+case failed it by decoding all 81 vertices to one position.
+
+### It is verified, not just compiled
+
+The classification pass runs on the GPU and produces a number nothing else can check, so the same pass exists
+in managed code over the same closed-form terrain, and startup compares them **per brick**:
+
+```
+[11:16:30 INF] brick classify self-test passed: 256 brick(s), 77 containing surface
+```
+
+A count rather than a boolean, deliberately. A pass that reported "the surface touches every brick" would
+satisfy a boolean check while exhausting the brick pool, and a pass one workgroup short would satisfy a
+"some bricks were classified" check while silently losing the tail. The count catches both, and it caught
+two real bugs during development — an incorrect per-lane reduction and a `DispatchFor` used where a
+workgroup-per-brick dispatch was needed. Both produced no validation error and no visible symptom.
+
+The self-test logs the first few disagreements with their brick coordinates, because a mismatch tells you the
+pass is wrong but not which brick exposed it.
+
+The managed side is unit-tested in
+[BrickClassifyTests.cs](tests/BrutalTestEngine.Tests/World/BrickClassifyTests.cs): the shader's declared
+workgroup size against the constant the dispatch uses, the push constant block's size and members, the cell
+corner and edge tables against the CPU's, and the reference's own behaviour.
+
+### The layout
+
+| File | Owns |
+| --- | --- |
+| [WorldSettings.cs](src/BrutalTestEngine/World/WorldSettings.cs) | The level count, brick shape and metric scale, and the bounds derived from them |
+| [ClipmapLevel.cs](src/BrutalTestEngine/World/ClipmapLevel.cs) | One ring: its metric, its anchor, and integer slot addressing |
+| [SdfClipmap.cs](src/BrutalTestEngine/World/SdfClipmap.cs) | The levels, the re-centring rule and the level-selection rule |
+| [BrickKey.cs](src/BrutalTestEngine/World/BrickKey.cs) | A brick's identity: its level and its lattice coordinate |
+| [SdfBrick.cs](src/BrutalTestEngine/World/SdfBrick.cs) | The field block, its ring, and the single definition of the cell tables |
+| [SurfaceNetExtractor.cs](src/BrutalTestEngine/World/SurfaceNetExtractor.cs) | Field block to mesh, watertight across brick boundaries |
+| [BrickMesh.cs](src/BrutalTestEngine/World/BrickMesh.cs) | The extracted mesh, and the octahedral normal encoding |
+| [MeshletBuilder.cs](src/BrutalTestEngine/World/MeshletBuilder.cs) | Mesh to bounded meshlets, with spheres and cones; also holds the `Meshlet` type |
+| [MeshletArena.cs](src/BrutalTestEngine/World/MeshletArena.cs) | The run-length GPU arena, where a brick's meshlets are packed and returned |
+| [BrickShape.cs](src/BrutalTestEngine/World/BrickShape.cs) | The hardware budgets, and the geometry bounds they imply |
+| [SdfBrickPool.cs](src/BrutalTestEngine/World/SdfBrickPool.cs) | The indirection table and the free list |
+| [DirtyBrickSet.cs](src/BrutalTestEngine/World/DirtyBrickSet.cs) | Which bricks need rebuilding, and the edit overlap query |
+| [SdfBrickStore.cs](src/BrutalTestEngine/World/SdfBrickStore.cs) | The CPU pipeline, from a clipmap slot to meshlets in the pools |
+| [BrickClassifier.cs](src/BrutalTestEngine/World/BrickClassifier.cs) | The CPU reference for the GPU classification pass |
+| [TerrainField.cs](src/BrutalTestEngine/World/TerrainField.cs) | The demonstration terrain the self-test runs on |
+| [WorldJobQueue.cs](src/BrutalTestEngine/Jobs/WorldJobQueue.cs) | The bounded multi-producer ring the frame thread feeds and the workers drain |
+| [WorldJobSystem.cs](src/BrutalTestEngine/Jobs/WorldJobSystem.cs) | The worker pool, the request marks, the meshlet arena and the commit path |
+| [WorldStreamer.cs](src/BrutalTestEngine/Jobs/WorldStreamer.cs) | Which bricks the world needs this frame, and the eviction rule |
+| [WorldJob.cs](src/BrutalTestEngine/Jobs/WorldJob.cs) | The job, the completion, the resident record and the draw command |
 
 ## Networking
 
@@ -982,12 +1282,60 @@ engine therefore serves the **Model Context Protocol** on its own thread, exposi
 data and its command grammar as a tool.
 
 ```sh
-dotnet run --project src/BrutalTestEngine.Game -- --mcp=41900
+dotnet run --project src/BrutalTestEngine.Game -- --mcp=7788
 ```
 
 ```
-MCP: http://127.0.0.1:41900/ exposing 111 variable(s) and the command grammar
+MCP: http://127.0.0.1:7788/ exposing 155 variable(s) and the command grammar
 ```
+
+### Connecting VS Code to a running game
+
+[.vscode/mcp.json](.vscode/mcp.json) registers the endpoint with VS Code, so Copilot can read and drive a
+live engine directly from the editor instead of you pasting JSON into a shell:
+
+```json
+{
+  "servers": {
+    "brutaltestengine": {
+      "type": "http",
+      "url": "http://127.0.0.1:7788/"
+    }
+  }
+}
+```
+
+Start the game on that port and the tools appear in Copilot's tool list:
+
+```sh
+dotnet run --project src/BrutalTestEngine.Game -- --mcp=7788
+```
+
+The **Run: game (MCP)** task (`Ctrl+Shift+B`, or *Tasks: Run Task*) does exactly that, and the
+**Game (MCP)** launch configuration starts it under the debugger. Both use 7788 so they agree with
+`mcp.json`; changing the port in one place means changing it in all three.
+
+The port is fixed rather than discovered deliberately. A client reads `mcp.json` once at startup, so the
+engine has to be where the file says it is — there is no handshake that could tell VS Code about a port
+chosen at launch.
+
+**When the game is not running the server shows as failed, and that is correct.** This is an HTTP
+endpoint, not a process VS Code can spawn, so there is nothing to start on demand. Start the game, then
+reconnect the server from the MCP view.
+
+#### The one gap: VS Code opens a GET stream
+
+The MCP spec lets a client open a `GET` stream for unsolicited server-to-client messages. The engine's
+transport is **stateless**, so there is no session such a stream could belong to, and the endpoint answers
+**405**. That is the status the spec names for a server offering no stream, and a client is expected to
+carry on without one — every tool call is a `POST` and is unaffected.
+
+This was a real bug for one commit. The request used to be forwarded to the SDK transport, which throws
+`InvalidOperationException` in stateless mode; the catch-all turned that into a **500**, which reads to a
+client as "the server is broken" and invites a retry. If a tool ever fails to connect while the game is
+demonstrably running, check the log for `MCP request failed` — a 500 with that message means the verb
+policy regressed, and [McpHttpVerbTests.cs](tests/BrutalTestEngine.Tests/Host/McpHttpVerbTests.cs) is what
+should have caught it.
 
 ### What it exposes
 
@@ -998,6 +1346,7 @@ MCP: http://127.0.0.1:41900/ exposing 111 variable(s) and the command grammar
 | Tool | `run_command` | Posts a command through the engine's own bus and returns the sequence number. |
 | Tool | `engine_status` | A one-call summary: frames, ticks, command counts, thread timings, subsystem availability. |
 | Tool | `recent_commands` | The most recent commands the engine accepted, with source and target. |
+| Tool | `capture_frame` | Reads the render target back and returns it as a PNG image. |
 | Resource | `bte://cvars` | Every variable, as a JSON object of name to value. |
 | Resource | `bte://status` | The status summary, as JSON. |
 | Resource | `bte://commands` | The recent command stream, as JSON. |
@@ -1007,6 +1356,42 @@ MCP: http://127.0.0.1:41900/ exposing 111 variable(s) and the command grammar
 The log window's own limits are readable too: `log.retained` and `log.overwritten` say how much history
 the window is holding and how much it has had to drop, so a client can tell a quiet engine from one whose
 log has holes in it.
+
+### Seeing the frame without a screenshot
+
+`capture_frame` is the one tool that returns something other than text: a base64 PNG of the frame the
+renderer just produced. It is not an operating-system screenshot, and the difference is the whole point.
+A screenshot of the desktop can be occluded by another window, scaled by the compositor, captured
+mid-present, or be of the wrong window entirely — and none of those failures look different from a
+rendering bug when all you have is pixels. Reading the swapchain image back before it is presented is the
+only way to see exactly what the renderer drew.
+
+The mechanics:
+
+1. The request sets a flag and waits. The caller may be the MCP thread; the render thread is the only one
+   that touches swapchain images, so the copy is recorded inside the frame loop.
+2. After `EndRenderPass`, the current image is transitioned from `PresentSrcKHR` to
+   `TransferSrcOptimal`, copied into a host-visible buffer with `vkCmdCopyImageToBuffer`, and
+   transitioned back — all in the same command buffer, so the frame's fence also covers the copy.
+3. The render thread waits on that fence and reads the buffer back, because reading it earlier would
+   return bytes the GPU is still writing.
+4. The pixels are encoded as PNG and returned as an `ImageContentBlock` alongside a text summary of the
+   dimensions and byte count.
+
+The PNG is written by hand — [PngEncoder.cs](src/BrutalTestEngine/Engine/PngEncoder.cs) is a signature,
+two chunks and a CRC — because the requirement is one call and an imaging library would add megabytes of
+native payload for the same output. It is lossless, which matters when the point is to look for
+single-pixel artefacts.
+
+One convention is worth stating because getting it wrong is invisible: **row 0 of the capture is the top
+of the image.** Vulkan's framebuffer origin is the upper left and an image-to-buffer copy preserves row
+order, so a "correct-looking" flip in the encoder produces an upside-down capture — which is
+indistinguishable from a broken renderer when the capture exists to debug the renderer.
+[RenderTargetImageTests.cs](tests/BrutalTestEngine.Tests/Engine/RenderTargetImageTests.cs) pins the row
+order rather than leaving it to the eye.
+
+Requesting a capture costs the render thread one fence wait, so it is a debugging tool, not something the
+frame loop does. Nothing in the engine calls it.
 
 ### Why it is built this way
 
@@ -1059,12 +1444,16 @@ outside the gate is a one-line change if that becomes the more useful default.
 
 ```sh
 # Every variable, as JSON.
-curl -s http://127.0.0.1:41900/ -H 'content-type: application/json' \
+curl -s http://127.0.0.1:7788/ -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_cvars","arguments":{}}}'
 
 # Every variable as one text blob, in a single call.
-curl -s http://127.0.0.1:41900/ -H 'content-type: application/json' \
+curl -s http://127.0.0.1:7788/ -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_cvar","arguments":{"name":"help"}}}'
+
+# What the renderer actually drew, as a base64 PNG.
+curl -s http://127.0.0.1:7788/ -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"capture_frame","arguments":{}}}'
 ```
 
 Any MCP client works. The engine's own verification uses the official SDK:
@@ -1072,7 +1461,7 @@ Any MCP client works. The engine's own verification uses the official SDK:
 ```csharp
 var transport = new HttpClientTransport(new HttpClientTransportOptions
 {
-    Endpoint = new Uri("http://127.0.0.1:41900/"),
+    Endpoint = new Uri("http://127.0.0.1:7788/"),
     TransportMode = HttpTransportMode.StreamableHttp,
 });
 
@@ -1485,6 +1874,18 @@ write there would show up as a garbled window rather than as a crash, and `Compu
 the dispatch group arithmetic — the case that silently leaves the tail of a field unprocessed — plus a
 test that fails if the C# local-size constant drifts from the shader's `local_size_x`.
 
+`tests/…/World/` is the largest group, because the world is the part of the engine where a wrong answer
+still looks plausible. Its cases are chosen so a failure is a failure rather than a difference of style:
+that a level's anchor only moves when the camera crosses a whole brick, that slot addressing round-trips
+and wraps a full grid period back onto itself, that brick keys stay exact hundreds of kilometres from the
+origin, that a closed surface is watertight — every half-edge of a sphere appears exactly twice in the
+index buffer, once in each direction — that a flat plane emits no half-edge twice, that every meshlet fits
+the hardware budget and its bounding sphere contains all of its own vertices, that splitting preserves
+every triangle, and that building the same brick twice produces byte-identical geometry. The
+classification tests compare the shader's declared workgroup size, push constant layout and cell tables
+against the managed constants, because those are the four things that can drift without a compiler
+noticing.
+
 `--selftest` is the end-to-end regression test for the command system: it drives every source from
 outside the engine and fails the run if a command does not land on the right target with the right
 count. `--frames=N` exercises the full startup/render/shutdown path, and `--validate` turns on Vulkan
@@ -1495,6 +1896,13 @@ its own output back and compares it against the same kernel computed on the CPU,
 `compute self-test passed` or `compute self-test FAILED`. A dispatch that silently does nothing produces
 no error and no visible symptom, so a comparison is the only way to know the plumbing works. Run
 `--frames=300` and look for that line after changing anything in [Compute/](src/BrutalTestEngine/Compute/).
+
+The world pipeline is verified per brick rather than per pass. The brick classification pass is the GPU
+stage, so it does its work twice — once on the GPU and once in managed code over the same terrain — and
+startup compares the two per brick, logging `brick classify self-test passed` or `brick classify self-test
+FAILED` with the first few disagreements and their brick coordinates. That check caught two real bugs
+during development, neither of which produced a validation error: an incorrect per-lane reduction and a
+`DispatchFor` used where a workgroup-per-brick dispatch was needed.
 
 The split matters. The unit tests run in a second and need no GPU, so they can gate every commit; the
 self-test boots the real Vulkan device and every thread, so it proves the wiring the tests stub out. A
@@ -1567,6 +1975,34 @@ Stated plainly, because an unowned gap is a standard nobody is held to:
   `Engine.Create`, so a host that never opens the listener cannot use the registry as a general
   introspection API. Moving the call outside the gate is a one-line change if that becomes the more
   useful default.
+- **The world pipeline's GPU half is partly unbuilt.** Classification runs on the GPU and is verified
+  against its CPU reference; extraction and meshlet splitting still run on the CPU, and the task and mesh
+  shader stages that consume the meshlets do not exist yet. The CPU versions are not placeholders — they
+  are the reference the GPU versions will be tested against — but they are not the shipping path, and the
+  pipeline's cost today is proportional to the brick being built rather than amortised over frames. See
+  [What is proven, and what is not](#what-is-proven-and-what-is-not).
+- **The shading model is a diagnostic palette.** The terrain is coloured by height and slope so that a
+  mis-shaped surface is visible. It is not a material system, and there is no lighting beyond that
+  gradient.
+- **The terrain is a demonstration function, not a generator.** `TerrainField`, `BrickClassifier` and
+  `ComputeShaders.BrickClassify` each carry a version of the same simple function, because the GPU pass and
+  its reference have to evaluate the identical thing to be comparable. That duplication is temporary and it
+  is why the classification tests assert the shader's constants against the managed ones rather than
+  trusting them; the real generator replaces all three.
+- **The clipmap covers a fixed volume, not a streaming world.** A level's grid is finite and the clipmap
+  wraps coordinates into it, so a point beyond the view distance aliases onto a slot inside the grid. That
+  is correct behaviour for a level whose resolution cannot resolve that distance, but it means there is no
+  representation of the world beyond the coarsest level's extent.
+- **The CPU meshes; the GPU classifies.** Extraction and the meshlet split are the reference implementations
+  the compute shaders will be tested against, not the final path.
+- **Only the finest clipmap level is populated.** Bricks are requested and built at level 0 and nowhere
+  else, so the world ends abruptly at the edge of the 64 m cube around the stream centre rather than
+  fading through the coarser levels. Both the request and evict passes agree on ownership — the
+  asymmetry that used to thrash them is gone — but nothing yet asks the outer levels for geometry, so the
+  LOD hierarchy exists as structure without contributing triangles. This is the next piece of world work.
+- **`world.requested` counts repeats.** It accumulates every request the streamer makes, including ones
+  already resident or in flight, so it is a measure of streamer work rather than of unique bricks. The
+  per-pass `Statistics.Requested` is the one to read for a rate.
 - **`Engine.cs` is a large composition root.** It creates eleven collaborators, owns the main loop and
   builds the console snapshot. Splitting the startup wiring into a builder would shorten it, but the
   file is also the one place where the whole object graph is visible, which is worth something.
@@ -1751,13 +2187,15 @@ that should grow into that responsibility, or the work that has not started.
 | 1. Core & Platform — windowing and input | Partial | [Window.cs](src/BrutalTestEngine/Engine/Window.cs) creates the GLFW window, polls events and owns windowed/borderless-fullscreen state. GLFW callbacks are forwarded to [InputThread.cs](src/BrutalTestEngine/Input/InputThread.cs), which folds them into a per-frame [InputSnapshot.cs](src/BrutalTestEngine/Input/InputSnapshot.cs); gamepad input is not captured yet. |
 | 1. Core & Platform — timing and loop | Started | [SimulationThread.cs](src/BrutalTestEngine/Simulation/SimulationThread.cs) runs a fixed-timestep accumulator on its own thread, decoupled from the frame rate, and reports its measured rate and dropped ticks. |
 | 1. Core & Platform — memory and jobs | Partial | `Brutal.Memory` and `Brutal.Concurrency` are referenced but not yet used directly. [IoThread.cs](src/BrutalTestEngine/Io/IoThread.cs) provides a background work queue, but there is no general job system or frame-scoped allocator. |
-| 2. Simulation & World | Minimal | [SimulationThread.cs](src/BrutalTestEngine/Simulation/SimulationThread.cs) runs the fixed-timestep tick and steps [EntityStore.cs](src/BrutalTestEngine/Simulation/EntityStore.cs), a struct-of-arrays store, then publishes an immutable [SimulationSnapshot.cs](src/BrutalTestEngine/Simulation/SimulationSnapshot.cs). No scene representation or spatial queries yet. It stays free of Vulkan types. |
+| 2. Simulation & World — entity store | Minimal | [SimulationThread.cs](src/BrutalTestEngine/Simulation/SimulationThread.cs) runs the fixed-timestep tick and steps [EntityStore.cs](src/BrutalTestEngine/Simulation/EntityStore.cs), a struct-of-arrays store, then publishes an immutable [SimulationSnapshot.cs](src/BrutalTestEngine/Simulation/SimulationSnapshot.cs). No scene representation or spatial queries yet. It stays free of Vulkan types. |
+| 2. Simulation & World — SDF world | Started | [src/BrutalTestEngine/World/](src/BrutalTestEngine/World/) holds the clipmap, the bricks, the extraction and the meshlet splitter. The GPU half is still being moved off the CPU — see [What is proven, and what is not](#what-is-proven-and-what-is-not). |
 | 2. Render extraction (Frame Packet) | Partial | The renderer still owns the triangle's vertex data, but the per-frame state it draws from now arrives as a `SimulationSnapshot` rather than being read directly. A `RenderView`/`FramePacket` type is the intended boundary between simulation and rendering. |
 | 3. Rendering & Vulkan RHI — device and swapchain | Started | [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs) builds the instance, surface, device, queues and swapchain; [SwapchainState.cs](src/BrutalTestEngine/Engine/SwapchainState.cs) groups everything rebuilt on resize. |
 | 3. Rendering & Vulkan RHI — allocator | Started | Vertex data goes through VMA in [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs), and [ComputeBuffer.cs](src/BrutalTestEngine/Compute/ComputeBuffer.cs) wraps a typed VMA allocation for compute. There is no general GPU resource abstraction yet. |
 | 3. Rendering & Vulkan RHI — frames in flight | Started | Two frames in flight in [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs), each with its own command buffer, acquire semaphore and fence; the render-finished semaphores are per swapchain image instead. Fences are keyed on the frame slot rather than the acquired image. |
 | 3. Rendering & Vulkan RHI — passes and draw submission | Started | A single render pass (clear → triangle → ImGui → present), recorded on the render thread by [RenderThread.cs](src/BrutalTestEngine/Engine/RenderThread.cs). No shadow, depth or post-processing passes, and no batching or indirect drawing. |
-| 3. Rendering & Vulkan RHI — compute | Started | [ComputePipeline.cs](src/BrutalTestEngine/Compute/ComputePipeline.cs) owns a compute pass end to end, and the demo field step proves it by reading its output back and comparing it against the CPU. No frame graph, so barriers are still written by hand. |
+| 3. Rendering & Vulkan RHI — compute | Started | [ComputePipeline.cs](src/BrutalTestEngine/Compute/ComputePipeline.cs) owns a compute pass end to end. The demo field step proves the abstraction by reading its output back and comparing it against the CPU; the brick classification pass proves the same thing per brick. No frame graph, so barriers are still written by hand. |
+| 3. Rendering & Vulkan RHI — mesh shaders | Not started | BRUTAL exposes what a meshlet pipeline needs (`VkShaderStageFlags.MeshBitEXT` and `TaskBitEXT`, `VkPhysicalDeviceMeshShaderFeaturesEXT`, `VkDrawMeshTasksIndirectCommandEXT`), but no pipeline is built against them. The meshlets they will consume are already produced on the CPU. |
 | 3. Synchronisation & render graph | Not started | Barriers are written by hand in [VulkanRenderer.cs](src/BrutalTestEngine/Engine/VulkanRenderer.cs), including the one after the compute dispatch. A render graph would declare pass inputs/outputs and insert them automatically. |
 | 4. Shaders, Materials & Pipelines | Minimal | [TriangleShaders.cs](src/BrutalTestEngine/Shaders/TriangleShaders.cs) and [ComputeShaders.cs](src/BrutalTestEngine/Shaders/ComputeShaders.cs) hold GLSL compiled at runtime with ShaderC, and pipelines are created inline. No SPIR-V reflection, pipeline cache, hot-reload or material system. |
 | 5. Asset Pipeline & Tooling | Not started | No cooker, no binary formats, no streaming. [Vertex.cs](src/BrutalTestEngine/Engine/Vertex.cs) defines the one vertex format the triangle uses. ImGui already provides an in-engine debug UI to build on. |

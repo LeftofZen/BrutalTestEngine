@@ -8,6 +8,7 @@ namespace BrutalTestEngine.Engine;
 internal sealed unsafe class SwapchainState
 {
     public required VkSwapchainKHR Swapchain { get; init; }
+    public required VkImage[] Images { get; init; }
     public required VkImageView[] ImageViews { get; init; }
     public required VkFramebuffer[] Framebuffers { get; init; }
     public required VkExtent2D Extent { get; init; }

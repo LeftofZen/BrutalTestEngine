@@ -1,0 +1,76 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "build",
+        "${workspaceFolder}/BrutalTestEngine.slnx"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "test",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "test",
+        "${workspaceFolder}/BrutalTestEngine.slnx"
+      ],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "format",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "format",
+        "whitespace",
+        "${workspaceFolder}/BrutalTestEngine.slnx"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "run: game (MCP)",
+      "detail": "Run the game with the MCP server on port 7788, the port .vscode/mcp.json points at.",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "run",
+        "--project",
+        "${workspaceFolder}/src/BrutalTestEngine.Game",
+        "--",
+        "--mcp=7788",
+        "--no-audio"
+      ],
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "run: validate",
+      "detail": "Headless run with validation layers on, then exit.",
+      "command": "dotnet",
+      "type": "process",
+      "args": [
+        "run",
+        "--project",
+        "${workspaceFolder}/src/BrutalTestEngine.Game",
+        "--",
+        "--frames=300",
+        "--no-audio",
+        "--validate"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

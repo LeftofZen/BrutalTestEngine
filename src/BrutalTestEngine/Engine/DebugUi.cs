@@ -205,6 +205,7 @@ public sealed class DebugUi : IDisposable
         ImGui.Text($"Entities: {snapshot.EntityCount} (struct-of-arrays store)");
 
         DrawThreadTimings(console);
+        DrawWorldPanel(console);
 
         ImGui.Separator();
         ImGui.Text("Simulation state"u8);
@@ -236,6 +237,64 @@ public sealed class DebugUi : IDisposable
         ImGui.TextWrapped("Escape closes the window. F11 toggles fullscreen. Run 'help' for commands."u8);
 
         ImGui.End();
+    }
+
+    /// <summary>
+    /// Shows the world pipeline's state: what the streamer decided, what the workers are doing, and how much
+    /// of the meshlet arena is in use.
+    /// </summary>
+    /// <remarks>
+    /// The interesting number here is the ratio of skipped to candidate slots. It is the whole reason the
+    /// streamer can run at frame rate: on real terrain the overwhelming majority of a level's slots hold only
+    /// air or only rock, and a pass that had to mesh them would not fit in a frame. When that ratio collapses,
+    /// the terrain has stopped being terrain and the cost is about to follow.
+    /// </remarks>
+    private static void DrawWorldPanel(ConsoleState console)
+    {
+        ImGui.Separator();
+        if (!ImGui.CollapsingHeader("World"u8, ImGuiTreeNodeFlags.DefaultOpen))
+            return;
+
+        if (!console.WorldEnabled)
+        {
+            ImGui.TextDisabled("World generation is off."u8);
+            return;
+        }
+
+        ImGui.Text($"Workers: {console.WorldWorkers}  View distance: {console.WorldViewDistance / 1000.0f:0.0} km");
+        ImGui.Text($"Camera: {console.WorldCamera}");
+        ImGui.Text($"Resident bricks: {console.WorldResidentBricks}  Meshlets: {console.WorldMeshlets}");
+        ImGui.Text(
+            $"Arena: {console.WorldArenaLive}/{console.WorldArenaCapacity} slots, "
+                + $"largest free run {console.WorldArenaLargestFree}"
+        );
+        ImGui.Text($"In flight: {console.WorldInFlight}  Waiting: {console.WorldWaiting}");
+
+        var candidates = console.WorldCandidates;
+        var skipped = console.WorldSkipped;
+        var skipPercent = candidates > 0 ? 100.0 * skipped / candidates : 0.0;
+
+        ImGui.Text(
+            $"Last pass: {candidates} candidate(s), {console.WorldSurface} surface, "
+                + $"{skipped} skipped ({skipPercent:0.0}%)"
+        );
+        ImGui.Text($"Empty results: {console.WorldEmpty}  Stale: {console.WorldStale}");
+
+        if (console.WorldOverflow > 0)
+        {
+            ImGui.TextColored(
+                new float4(1.0f, 0.7f, 0.2f, 1.0f),
+                $"Arena overflowed {console.WorldOverflow} time(s): raise MeshletsPerResidentBrick"
+            );
+        }
+
+        if (console.WorldBudgetExhausted)
+        {
+            ImGui.TextColored(
+                new float4(1.0f, 0.7f, 0.2f, 1.0f),
+                "Streamer stopped early: the pool or the queue is full"u8
+            );
+        }
     }
 
     /// <summary>

@@ -60,6 +60,7 @@ public sealed class McpServerThread : IDisposable
     private readonly CvarRegistry _cvars;
     private readonly McpCommandSource _commands;
     private readonly Func<EngineStatus> _readStatus;
+    private readonly Func<TimeSpan, CancellationToken, Task<RenderTargetImage?>>? _capture;
     private readonly HttpListener _listener;
     private readonly StreamableHttpServerTransport _transport;
     private readonly McpServer _server;
@@ -87,12 +88,16 @@ public sealed class McpServerThread : IDisposable
     /// <param name="readStatus">Produces the engine's status summary.</param>
     /// <param name="port">The loopback port to listen on.</param>
     /// <param name="timers">Where this thread records its own cost.</param>
+    /// <param name="capture">
+    /// Captures the render target's pixels, or null when the host has no renderer to capture.
+    /// </param>
     public McpServerThread(
         CvarRegistry cvars,
         CommandBus bus,
         Func<EngineStatus> readStatus,
         int port,
-        ThreadTimerRegistry timers
+                ThreadTimerRegistry timers,
+                Func<TimeSpan, CancellationToken, Task<RenderTargetImage?>>? capture = null
     )
     {
         ArgumentNullException.ThrowIfNull(cvars);
@@ -103,6 +108,7 @@ public sealed class McpServerThread : IDisposable
 
         _cvars = cvars;
         _readStatus = readStatus;
+        _capture = capture;
         _commands = new McpCommandSource(bus);
         _pollMetrics = timers.Get(ThreadTimerRegistry.Keys.McpPoll);
         _requestMetrics = timers.Get(ThreadTimerRegistry.Keys.McpRequest);
@@ -213,7 +219,7 @@ public sealed class McpServerThread : IDisposable
             Handlers = new McpServerHandlers
             {
                 ListToolsHandler = (_, _) => ValueTask.FromResult(ListTools()),
-                CallToolHandler = (request, _) => ValueTask.FromResult(CallTool(request.Params)),
+                CallToolHandler = (request, _) => CallToolAsync(request.Params),
                 ListResourcesHandler = (_, _) => ValueTask.FromResult(ListResources()),
                 ListResourceTemplatesHandler = (_, _) => ValueTask.FromResult(ListResourceTemplates()),
                 ReadResourceHandler = (request, _) => ValueTask.FromResult(ReadResource(request.Params.Uri)),
@@ -288,6 +294,24 @@ public sealed class McpServerThread : IDisposable
                     InputSchema = Schema("""{"type":"object","properties":{},"additionalProperties":false}"""),
                     Annotations = new ToolAnnotations { ReadOnlyHint = true, IdempotentHint = true },
                 },
+                new Tool
+                {
+                    Name = "capture_frame",
+                    Title = "Capture the rendered frame",
+                    Description =
+                        "Reads the render target back and returns it as a PNG image. This is the actual pixels "
+                        + "the renderer produced, not an operating-system screenshot: it cannot be occluded by "
+                        + "another window, scaled by the desktop compositor, or captured mid-present. Use it to "
+                        + "see what the engine is drawing.",
+                    InputSchema = Schema(
+                        """
+                        {"type":"object","properties":{"timeout_ms":{"type":"integer","minimum":16,"maximum":10000,
+                        "description":"How long to wait for the render thread to service the request."}},
+                        "additionalProperties":false}
+                        """
+                    ),
+                    Annotations = new ToolAnnotations { ReadOnlyHint = true, IdempotentHint = false },
+                },
             ],
         };
 
@@ -347,7 +371,7 @@ public sealed class McpServerThread : IDisposable
             ],
         };
 
-    private CallToolResult CallTool(CallToolRequestParams parameters)
+    private async ValueTask<CallToolResult> CallToolAsync(CallToolRequestParams parameters)
     {
         var name = parameters.Name ?? string.Empty;
 
@@ -358,8 +382,63 @@ public sealed class McpServerThread : IDisposable
             "run_command" => RunCommand(parameters),
             "engine_status" => Text(JsonSerializer.Serialize(StatusDocument(), JsonOptions)),
             "recent_commands" => Text(JsonSerializer.Serialize(CommandDocument(), JsonOptions)),
+            "capture_frame" => await CaptureFrame(parameters).ConfigureAwait(false),
             _ => Error($"unknown tool '{name}'"),
         };
+    }
+
+    private async ValueTask<CallToolResult> CaptureFrame(CallToolRequestParams parameters)
+    {
+        if (_capture is null)
+            return Error("this host has no renderer to capture");
+
+        var timeout = TimeSpan.FromMilliseconds(ReadTimeoutMilliseconds(parameters));
+
+        var image = await _capture(timeout, CancellationToken.None).ConfigureAwait(false);
+
+        if (image is null)
+        {
+            return Error(
+                $"no frame was captured within {timeout.TotalMilliseconds:0} ms; the renderer may be "
+                    + "resizing, occluded, or shutting down"
+            );
+        }
+
+        var png = image.ToPng();
+
+        // The image is returned as a content block alongside a short text summary, because a client that
+        // cannot render images still needs to know what it asked for and how big it was.
+        return new CallToolResult
+        {
+            Content =
+            [
+                new TextContentBlock
+                    {
+                        Text =
+                            $"{image.Width}x{image.Height} PNG, {png.Length} bytes, "
+                            + $"{(image.IsSrgb ? "sRGB" : "linear")} source",
+                    },
+                    ImageContentBlock.FromBytes(png, "image/png"),
+                ],
+        };
+    }
+
+    /// <summary>Reads the optional <c>timeout_ms</c> argument, clamped to something a frame can satisfy.</summary>
+    private static int ReadTimeoutMilliseconds(CallToolRequestParams parameters)
+    {
+        const int Default = 2000;
+
+        if (parameters.Arguments is not { } arguments || !arguments.TryGetValue("timeout_ms", out var value))
+            return Default;
+
+        var milliseconds = value.ValueKind switch
+        {
+            JsonValueKind.Number when value.TryGetInt32(out var number) => number,
+            JsonValueKind.String when int.TryParse(value.GetString(), out var parsed) => parsed,
+            _ => Default,
+        };
+
+        return Math.Clamp(milliseconds, 16, 10000);
     }
 
     private CallToolResult GetCvar(CallToolRequestParams parameters)
@@ -598,34 +677,16 @@ public sealed class McpServerThread : IDisposable
 
         try
         {
-            var request = context.Request;
+            var status = ResponseStatusFor(context.Request.HttpMethod);
 
-            switch (request.HttpMethod)
+            if (status == 0)
             {
-                case "POST":
-                    HandlePost(context);
-                    break;
-
-                case "GET":
-                    // The standalone server-to-client stream. Nothing here pushes unsolicited messages, but a
-                    // client is entitled to open it, so it is served rather than refused.
-                    context.Response.ContentType = "text/event-stream";
-                    context.Response.StatusCode = 200;
-                    _transport.HandleGetRequestAsync(context.Response.OutputStream, _cancellation.Token)
-                        .GetAwaiter()
-                        .GetResult();
-                    break;
-
-                case "DELETE":
-                    // Session termination. The transport is stateless, so there is nothing to tear down.
-                    context.Response.StatusCode = 204;
-                    context.Response.Close();
-                    break;
-
-                default:
-                    context.Response.StatusCode = 405;
-                    context.Response.Close();
-                    break;
+                HandlePost(context);
+            }
+            else
+            {
+                context.Response.StatusCode = status;
+                context.Response.Close();
             }
         }
         catch (Exception exception)
@@ -642,6 +703,31 @@ public sealed class McpServerThread : IDisposable
             _requestMetrics.RecordSince(startedAt);
         }
     }
+
+    /// <summary>
+    /// The HTTP status a verb gets, or <c>0</c> when the verb needs the request body handled.
+    /// </summary>
+    /// <remarks>
+    /// Split out from <see cref="Handle"/> so the verb policy is testable without an <c>HttpListenerContext</c>,
+    /// which cannot be constructed outside a live listener.
+    /// <para>
+    /// <b>GET is 405, not 500.</b> The spec's server-to-client stream needs a session to belong to, and a
+    /// stateless transport never has one. That is a capability this endpoint does not offer, which is what 405
+    /// says. It used to fall through to the transport, which raised <c>InvalidOperationException</c> — turning a
+    /// documented "not supported" into a 500 that reads as a server fault and invites a client to retry.
+    /// </para>
+    /// <para>
+    /// <b>DELETE is 204.</b> It means "end the session", and there is no session, so the request is already
+    /// satisfied rather than unsupported.
+    /// </para>
+    /// </remarks>
+    internal static int ResponseStatusFor(string method) =>
+        method switch
+        {
+            "POST" => 0,
+            "DELETE" => 204,
+            _ => 405,
+        };
 
     private void HandlePost(HttpListenerContext context)
     {

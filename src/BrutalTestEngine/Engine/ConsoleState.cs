@@ -171,4 +171,58 @@ public sealed class ConsoleState
     /// the panel only reads it for display; nothing here mutates it.
     /// </summary>
     public required KeyValuePair<string, ThreadMetrics>[] ThreadTimings { get; init; }
+
+    /// <summary>True when the world is being generated and drawn at all.</summary>
+    public required bool WorldEnabled { get; init; }
+
+    /// <summary>World-generation worker threads.</summary>
+    public required int WorldWorkers { get; init; }
+
+    /// <summary>Bricks currently holding geometry.</summary>
+    public required long WorldResidentBricks { get; init; }
+
+    /// <summary>Meshlets built this session.</summary>
+    public required long WorldMeshlets { get; init; }
+
+    /// <summary>Meshlet slots the arena has handed out.</summary>
+    public required int WorldArenaLive { get; init; }
+
+    /// <summary>Meshlet slots the arena can hand out.</summary>
+    public required int WorldArenaCapacity { get; init; }
+
+    /// <summary>Largest contiguous run of free meshlet slots.</summary>
+    public required int WorldArenaLargestFree { get; init; }
+
+    /// <summary>Brick builds queued but not yet finished.</summary>
+    public required long WorldInFlight { get; init; }
+
+    /// <summary>Finished bricks waiting to be committed.</summary>
+    public required int WorldWaiting { get; init; }
+
+    /// <summary>Bricks that produced no geometry because they held no surface.</summary>
+    public required long WorldEmpty { get; init; }
+
+    /// <summary>Results discarded because a recentring invalidated them.</summary>
+    public required long WorldStale { get; init; }
+
+    /// <summary>Commits that could not get a contiguous run of meshlet slots.</summary>
+    public required long WorldOverflow { get; init; }
+
+    /// <summary>Slots the last streamer pass considered.</summary>
+    public required int WorldCandidates { get; init; }
+
+    /// <summary>Slots the last streamer pass believes contain surface.</summary>
+    public required int WorldSurface { get; init; }
+
+    /// <summary>Slots the last streamer pass skipped as all air or all rock.</summary>
+    public required int WorldSkipped { get; init; }
+
+    /// <summary>True when the last streamer pass stopped early because the pool or queue was full.</summary>
+    public required bool WorldBudgetExhausted { get; init; }
+
+    /// <summary>Radius the coarsest clipmap level covers, in metres.</summary>
+    public required float WorldViewDistance { get; init; }
+
+    /// <summary>The position the last streamer pass ran for.</summary>
+    public required string WorldCamera { get; init; }
 }

@@ -1,0 +1,15 @@
+{
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "editor.formatOnSave": false,
+  "dotnet.defaultSolution": "BrutalTestEngine.slnx",
+  "search.exclude": {
+    "**/bin": true,
+    "**/obj": true
+  },
+  "files.watcherExclude": {
+    "**/bin/**": true,
+    "**/obj/**": true
+  }
+}

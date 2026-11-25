@@ -1,0 +1,49 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Game (MCP)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build",
+      "program": "${workspaceFolder}/src/BrutalTestEngine.Game/bin/Debug/net10.0/BrutalTestEngine.Game.exe",
+      "args": [
+        "--mcp=7788",
+        "--no-audio"
+      ],
+      "cwd": "${workspaceFolder}/src/BrutalTestEngine.Game",
+      "console": "internalConsole",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Game (MCP, validation)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build",
+      "program": "${workspaceFolder}/src/BrutalTestEngine.Game/bin/Debug/net10.0/BrutalTestEngine.Game.exe",
+      "args": [
+        "--mcp=7788",
+        "--no-audio",
+        "--validate"
+      ],
+      "cwd": "${workspaceFolder}/src/BrutalTestEngine.Game",
+      "console": "internalConsole",
+      "stopAtEntry": false
+    },
+    {
+      "name": "Game (headless, 300 frames)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build",
+      "program": "${workspaceFolder}/src/BrutalTestEngine.Game/bin/Debug/net10.0/BrutalTestEngine.Game.exe",
+      "args": [
+        "--frames=300",
+        "--no-audio",
+        "--validate"
+      ],
+      "cwd": "${workspaceFolder}/src/BrutalTestEngine.Game",
+      "console": "internalConsole",
+      "stopAtEntry": false
+    }
+  ]
+}

@@ -7,9 +7,11 @@ using BrutalTestEngine.Database;
 using BrutalTestEngine.Host;
 using BrutalTestEngine.Input;
 using BrutalTestEngine.Io;
+using BrutalTestEngine.Jobs;
 using BrutalTestEngine.Logging;
 using BrutalTestEngine.Networking;
 using BrutalTestEngine.Simulation;
+using BrutalTestEngine.World;
 using MSLogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace BrutalTestEngine.Engine;
@@ -90,6 +92,10 @@ public sealed class Engine : IDisposable, ICommandHandler
     private readonly WebCommandSource? _webSource;
     private readonly DatabaseCommandSource? _databaseSource;
     private readonly McpServerThread? _mcpServer;
+    private readonly WorldJobSystem? _world;
+    private readonly WorldStreamer? _streamer;
+    private readonly SdfClipmap? _clipmap;
+    private readonly TerrainField? _terrain;
     private readonly CvarRegistry _cvars;
     private readonly CommandSelfTest? _selfTest;
     private readonly StrongBox<long> _inputCommandsObserved;
@@ -144,6 +150,10 @@ public sealed class Engine : IDisposable, ICommandHandler
         WebCommandSource? webSource,
         DatabaseCommandSource? databaseSource,
         McpServerThread? mcpServer,
+        WorldJobSystem? world,
+        WorldStreamer? streamer,
+        SdfClipmap? clipmap,
+        TerrainField? terrain,
         CvarRegistry cvars,
         CommandSelfTest? selfTest,
         StrongBox<long> inputCommandsObserved,
@@ -169,6 +179,10 @@ public sealed class Engine : IDisposable, ICommandHandler
         _webSource = webSource;
         _databaseSource = databaseSource;
         _mcpServer = mcpServer;
+        _world = world;
+        _streamer = streamer;
+        _clipmap = clipmap;
+        _terrain = terrain;
         _cvars = cvars;
         _selfTest = selfTest;
         _inputCommandsObserved = inputCommandsObserved;
@@ -205,6 +219,10 @@ public sealed class Engine : IDisposable, ICommandHandler
         WebCommandSource? webSource = null;
         DatabaseCommandSource? databaseSource = null;
         McpServerThread? mcpServer = null;
+        WorldJobSystem? world = null;
+        WorldStreamer? streamer = null;
+        SdfClipmap? clipmap = null;
+        TerrainField? terrain = null;
         CommandSelfTest? selfTest = null;
         var bindings = KeyBindings.CreateDefault();
 
@@ -295,6 +313,28 @@ public sealed class Engine : IDisposable, ICommandHandler
             window.Handle.OnChar += (_, codePoint) => commandBus.Post(InputCommands.Text(codePoint));
             window.Handle.OnFocus += (_, focusEvent) => commandBus.Post(InputCommands.Focus(focusEvent));
 
+            // The world is created before the render thread starts, because the renderer is handed the job
+            // system's pools once and reads them from then on. The clipmap is centred on the origin rather
+            // than on the camera, because the camera does not exist until the first frame; the first
+            // streamer pass recentres it, which is a no-op for a camera already inside the innermost level.
+            if (options.EnableWorld)
+            {
+                var worldSettings = options.World ?? WorldSettings.Default;
+                var worldOptions = options.WorldJobs ?? WorldJobSystemOptions.Default;
+
+                terrain = new TerrainField(worldSettings.Seed);
+
+                // The pool's id budget is the job system's resident-brick budget, because that is what sizes
+                // the job system's per-brick arrays. Letting the pool hand out more ids than that would index
+                // past them.
+                clipmap = new SdfClipmap(worldSettings, default, worldOptions.MaxResidentBricks);
+                world = new WorldJobSystem(worldSettings, worldOptions, timers);
+                streamer = new WorldStreamer(world, timers);
+
+                world.Start();
+                renderer.AttachWorld(world);
+            }
+
             renderThread = new RenderThread(renderer, timers);
 
             simulationThread = new SimulationThread(
@@ -348,6 +388,9 @@ public sealed class Engine : IDisposable, ICommandHandler
                     rconServer,
                     webSource,
                     databaseSource,
+                    world,
+                    streamer,
+                    clipmap,
                     timers
                 );
 
@@ -368,7 +411,10 @@ public sealed class Engine : IDisposable, ICommandHandler
                         networkFault
                     ),
                     mcpPort,
-                    timers
+                                        timers,
+                                        capture: renderer is null
+                                            ? null
+                                            : (timeout, cancellationToken) => renderer.CaptureFrameAsync(timeout, cancellationToken)
                 );
             }
         }
@@ -376,6 +422,7 @@ public sealed class Engine : IDisposable, ICommandHandler
         {
             selfTest?.Dispose();
             mcpServer?.Dispose();
+            world?.Dispose();
             databaseSource?.Dispose();
             webSource?.Dispose();
             rconServer?.Dispose();
@@ -393,6 +440,11 @@ public sealed class Engine : IDisposable, ICommandHandler
             commandBus.Dispose();
             throw;
         }
+
+        // The catch above rethrows, so creation succeeded and these exist. ThrowIfNull tells the compiler that
+        // rather than asserting it with a null-forgiving operator, and it costs one branch at startup.
+        ArgumentNullException.ThrowIfNull(renderer);
+        ArgumentNullException.ThrowIfNull(rconServer);
 
         Console.WriteLine($"Vulkan device: {renderer.DeviceName}");
         Console.WriteLine($"Swapchain: {renderer.Extent.Width}x{renderer.Extent.Height}, {renderer.ImageCount} images");
@@ -450,6 +502,10 @@ public sealed class Engine : IDisposable, ICommandHandler
             webSource,
             databaseSource,
             mcpServer,
+            world,
+            streamer,
+            clipmap,
+            terrain,
             cvars,
             selfTest,
             inputCommandsObserved,
@@ -566,6 +622,8 @@ public sealed class Engine : IDisposable, ICommandHandler
 
             _renderThread.RequestResize(framebufferSize);
 
+            UpdateWorld();
+
             var snapshot = ReadSimulationSnapshot();
             var input = ReadInputSnapshot();
 
@@ -629,6 +687,10 @@ public sealed class Engine : IDisposable, ICommandHandler
         _audioThread.Dispose();
 
         _renderThread.Dispose();
+
+        // The world's workers are stopped after the render thread, because the renderer reads the job
+        // system's pools while it draws and a worker still writing them would be a race.
+        _world?.Dispose();
 
         // Reverse creation order: the ImGui context references the render pass and the window.
         _debugUi.Dispose();
@@ -833,6 +895,9 @@ public sealed class Engine : IDisposable, ICommandHandler
         RconServer rconServer,
         WebCommandSource? webSource,
         DatabaseCommandSource? databaseSource,
+        WorldJobSystem? world,
+        WorldStreamer? streamer,
+        SdfClipmap? clipmap,
         ThreadTimerRegistry timers
     )
     {
@@ -873,6 +938,44 @@ public sealed class Engine : IDisposable, ICommandHandler
         cvars.RegisterValue("audio.available", () => audioThread.Audio.IsAvailable, "bool", "True when an audio device was opened.");
         cvars.RegisterValue("audio.channels", () => audioThread.Audio.PlayingChannels, "int", "Channels the mixer is currently playing.");
         cvars.RegisterValue("audio.updates", () => audioThread.Audio.UpdateCount, "long", "Mixer updates performed this session.");
+
+        // The world's variables are registered from the job system's own counters rather than from a copy, so
+        // a client reading them over MCP sees the same numbers the debug panel does, live.
+        if (world is not null && streamer is not null && clipmap is not null)
+        {
+            var jobs = world;
+            var streaming = streamer;
+            var map = clipmap;
+
+            cvars.RegisterValue("world.workers", () => jobs.WorkerCount, "int", "World-generation worker threads.");
+            cvars.RegisterValue("world.epoch", () => jobs.Epoch, "long", "Generation counter; bumped whenever the clipmap recentres.");
+            cvars.RegisterValue("world.submitted", () => jobs.SubmittedCount, "long", "Brick builds queued to the workers.");
+            cvars.RegisterValue("world.completed", () => jobs.CompletedCount, "long", "Brick builds the workers finished.");
+            cvars.RegisterValue("world.inFlight", () => jobs.InFlightCount, "long", "Brick builds queued but not yet finished.");
+            cvars.RegisterValue("world.waiting", () => jobs.CompletionsWaiting, "int", "Finished bricks waiting to be committed.");
+            cvars.RegisterValue("world.empty", () => jobs.EmptyCount, "long", "Bricks that produced no geometry because they held no surface.");
+            cvars.RegisterValue("world.stale", () => jobs.StaleResultCount, "long", "Results discarded because a recentring invalidated them.");
+            cvars.RegisterValue("world.noBuffer", () => jobs.NoBufferCount, "long", "Results dropped because no reusable buffer was free.");
+            cvars.RegisterValue("world.overflow", () => jobs.OverflowCount, "long", "Commits that could not get a contiguous run of meshlet slots.");
+            cvars.RegisterValue("world.resident", () => jobs.ResidentBrickCount, "long", "Bricks currently holding geometry.");
+            cvars.RegisterValue("world.meshlets", () => jobs.MeshletsBuilt, "long", "Meshlets built this session.");
+            cvars.RegisterValue("world.arenaCapacity", () => jobs.MeshletCapacity, "int", "Meshlet slots the arena can hand out.");
+            cvars.RegisterValue("world.arenaLive", () => jobs.Arena.LiveCount, "int", "Meshlet slots currently allocated.");
+            cvars.RegisterValue("world.arenaLargestFree", () => jobs.Arena.LargestFreeRun, "int", "Largest contiguous run of free meshlet slots.");
+            cvars.RegisterValue("world.arenaFailures", () => jobs.Arena.FailureCount, "long", "Allocations the arena could not satisfy.");
+            cvars.RegisterValue("world.poolAllocated", () => map.Pool.AllocatedCount, "int", "Brick pool slots in use.");
+            cvars.RegisterValue("world.poolCapacity", () => map.Pool.Capacity, "int", "Brick pool slots available.");
+            cvars.RegisterValue("world.levels", () => map.LevelCount, "int", "Clipmap levels.");
+            cvars.RegisterValue("world.viewDistance", () => map.Settings.ViewDistance, "float", "Radius the coarsest clipmap level covers, in metres.");
+            cvars.RegisterValue("world.passes", () => streaming.PassCount, "long", "Streamer passes run.");
+            cvars.RegisterValue("world.requested", () => streaming.TotalRequested, "long", "Bricks requested across every pass.");
+            cvars.RegisterValue("world.evicted", () => streaming.TotalEvicted, "long", "Resident bricks evicted across every pass.");
+            cvars.RegisterValue("world.candidates", () => streaming.Statistics.Candidates, "int", "Slots the last pass considered.");
+            cvars.RegisterValue("world.surface", () => streaming.Statistics.SurfaceBricks, "int", "Slots the last pass believes contain surface.");
+            cvars.RegisterValue("world.skipped", () => streaming.Statistics.Skipped, "int", "Slots the last pass skipped as all air or all rock.");
+            cvars.RegisterValue("world.budgetExhausted", () => streaming.Statistics.BudgetExhausted, "bool", "True when the last pass stopped early because the pool or queue was full.");
+            cvars.RegisterValue("world.camera", () => $"{streaming.Camera.X:0.#},{streaming.Camera.Y:0.#},{streaming.Camera.Z:0.#}", "string", "The position the last streamer pass ran for.");
+        }
 
         cvars.RegisterValue("rcon.port", () => rconServer.Port, "int", "Loopback port of the remote console listener.");
         cvars.RegisterValue("rcon.clients", () => rconServer.ClientCount, "int", "Clients currently connected to the remote console.");
@@ -1014,6 +1117,73 @@ public sealed class Engine : IDisposable, ICommandHandler
     }
 
     /// <summary>
+    /// Advances world streaming for this frame and hands the result to the renderer.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The order matters. The streamer decides what the world needs and queues it, then the finished bricks
+    /// are committed into the destination pools, and only then is the draw list published. Publishing before
+    /// committing would hand the renderer a list that names geometry the pools do not hold yet.
+    /// </para>
+    /// <para>
+    /// The commit budget is what keeps a burst of completions from becoming a hitch. When the workers warm
+    /// up they finish in waves, and an unbounded commit would copy every wave's geometry in one frame. The
+    /// cap spreads that over several frames, and because the streamer re-requests nothing that is already
+    /// resident, the backlog drains without the world being rebuilt.
+    /// </para>
+    /// </remarks>
+    private void UpdateWorld()
+    {
+        if (_world is not { } world || _streamer is not { } streamer || _clipmap is not { } clipmap)
+            return;
+
+        if (_terrain is not { } terrain)
+            return;
+
+        var camera = CameraPosition;
+
+        // The clipmap is centred on the *terrain surface* under the camera's horizontal position, not on the
+        // camera itself. The levels are nested cubes, so the finest level only owns what falls inside its
+        // small cube; centring that cube at flying altitude puts the whole terrain band inside a coarse
+        // level's cube instead, and the world then resolves at tens of metres per brick with gaps between
+        // them. A heightfield's finest detail belongs where the ground is, which is directly below the
+        // viewpoint.
+        var streamCenter = new float3(camera.X, terrain.HeightAt(camera.X, camera.Z), camera.Z);
+
+        streamer.Update(streamCenter, clipmap, terrain);
+        streamer.CommitReady(MaxWorldCommitsPerFrame);
+
+        _renderer.SetCamera(camera, CameraTarget, CameraFieldOfView);
+        _renderer.PublishDraws(world.BuildDrawList(), world.CompletedCount);
+    }
+
+    /// <summary>
+    /// How many finished bricks one frame may copy into the destination pools.
+    /// </summary>
+    /// <remarks>
+    /// A commit is a memcpy of a few kilobytes, so this is a budget of roughly a megabyte of copying per
+    /// frame — small enough not to show up in a frame time, large enough that a cold start fills in within a
+    /// second or two.
+    /// </remarks>
+    private const int MaxWorldCommitsPerFrame = 64;
+
+    /// <summary>
+    /// Where the camera is, in world space.
+    /// </summary>
+    /// <remarks>
+    /// A fixed vantage point for now, a little above the terrain's mean height and far enough back to see the
+    /// clipmap's inner levels and the fog close the horizon. It is a property rather than a constant so the
+    /// debug panel and the cvars can move it without a rebuild.
+    /// </remarks>
+    private float3 CameraPosition { get; set; } = new(0.0f, 160.0f, 300.0f);
+
+    /// <summary>What the camera looks at.</summary>
+    private float3 CameraTarget { get; set; } = new(0.0f, 20.0f, 0.0f);
+
+    /// <summary>The camera's vertical field of view, in radians. Sixty degrees.</summary>
+    private float CameraFieldOfView { get; set; } = 1.0472f;
+
+    /// <summary>
     /// Posts a line typed into the console. The console itself never reaches into the engine: a submitted
     /// line becomes a command on the bus, which is the same path every other source takes.
     /// </summary>
@@ -1078,6 +1248,26 @@ public sealed class Engine : IDisposable, ICommandHandler
             CaptureCount = _renderer.Capture.CaptureCount,
             LogLevel = EngineLog.MinimumLevel.ToString(),
             LogDroppedCount = EngineLog.DroppedCount,
+            WorldEnabled = _world is not null,
+            WorldWorkers = _world?.WorkerCount ?? 0,
+            WorldResidentBricks = _world?.ResidentBrickCount ?? 0,
+            WorldMeshlets = _world?.MeshletsBuilt ?? 0,
+            WorldArenaLive = _world?.Arena.LiveCount ?? 0,
+            WorldArenaCapacity = _world?.Arena.Capacity ?? 0,
+            WorldArenaLargestFree = _world?.Arena.LargestFreeRun ?? 0,
+            WorldInFlight = _world?.InFlightCount ?? 0,
+            WorldWaiting = _world?.CompletionsWaiting ?? 0,
+            WorldEmpty = _world?.EmptyCount ?? 0,
+            WorldStale = _world?.StaleResultCount ?? 0,
+            WorldOverflow = _world?.OverflowCount ?? 0,
+            WorldCandidates = _streamer?.Statistics.Candidates ?? 0,
+            WorldSurface = _streamer?.Statistics.SurfaceBricks ?? 0,
+            WorldSkipped = _streamer?.Statistics.Skipped ?? 0,
+            WorldBudgetExhausted = _streamer?.Statistics.BudgetExhausted ?? false,
+            WorldViewDistance = _clipmap?.Settings.ViewDistance ?? 0.0f,
+            WorldCamera = _streamer is { } s
+                ? $"{s.Camera.X:0.#}, {s.Camera.Y:0.#}, {s.Camera.Z:0.#}"
+                : "n/a",
         };
     }
 }
